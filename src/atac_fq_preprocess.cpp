@@ -11,7 +11,8 @@
 #include <sstream>
 #include <cstdlib>
 #include <utility>
-#include <filesystem>
+#include <cerrno>
+#include <climits>
 #include <sys/stat.h>
 #include <zlib.h>
 #include <htswrapper/bc.h>
@@ -66,6 +67,49 @@ string filename_nopath(string& filename){
     else{
         return filename;
     }
+}
+
+/**
+ * Resolve an existing path, or resolve its existing parent directory and
+ * append the final component. The latter lets us compare an input with an
+ * output destination before the output file has been created.
+ */
+string canonical_path_or_destination(const string& path){
+    char resolved[PATH_MAX];
+    if (realpath(path.c_str(), resolved) != NULL){
+        return string(resolved);
+    }
+
+    size_t trim_idx = path.find_last_of("\\/");
+    string parent;
+    string basename;
+    if (trim_idx == string::npos){
+        parent = ".";
+        basename = path;
+    }
+    else{
+        parent = trim_idx == 0 ? "/" : path.substr(0, trim_idx);
+        basename = path.substr(trim_idx + 1);
+    }
+
+    char parent_resolved[PATH_MAX];
+    if (realpath(parent.c_str(), parent_resolved) == NULL){
+        return "";
+    }
+
+    string result(parent_resolved);
+    if (result[result.length()-1] != '/'){
+        result += "/";
+    }
+    return result + basename;
+}
+
+bool same_path_or_destination(const string& left, const string& right){
+    string left_canonical = canonical_path_or_destination(left);
+    string right_canonical = canonical_path_or_destination(right);
+    return left_canonical.length() > 0 &&
+        right_canonical.length() > 0 &&
+        left_canonical == right_canonical;
 }
 
 int main(int argc, char *argv[]) {    
@@ -148,30 +192,54 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
     
-    if (output_dir[output_dir.length()-1] == '/'){
+    while (output_dir.length() > 1 && output_dir[output_dir.length()-1] == '/'){
         output_dir = output_dir.substr(0, output_dir.length()-1);
     }
 
     // Create output directory if it doesn't exist
-    if (!mkdir(output_dir.c_str(), 0775)){
-        // Assume directory already exists
+    if (mkdir(output_dir.c_str(), 0775) != 0 && errno != EEXIST){
+        fprintf(stderr, "ERROR: unable to create output directory %s: %s\n",
+            output_dir.c_str(), strerror(errno));
+        exit(1);
+    }
+    struct stat output_dir_stat;
+    if (stat(output_dir.c_str(), &output_dir_stat) != 0 || !S_ISDIR(output_dir_stat.st_mode)){
+        fprintf(stderr, "ERROR: output path is not a directory: %s\n", output_dir.c_str());
+        exit(1);
     }
     output_dir += "/";
 
     string r1out = output_dir + filename_nopath(r1fn);
     string r2out = output_dir + filename_nopath(r2fn);
-    
-    filesystem::path p1 = r1fn;
-    filesystem::path p2 = r1out;
 
-    if (filesystem::equivalent(p1, p2)){
-        fprintf(stderr, "ERROR: input and output directories match - files will be overwritten.\n");
+    // Never open an output that resolves to any input. gzopen(..., "w") would
+    // truncate the source FASTQ before bc_scanner has a chance to read it.
+    if (same_path_or_destination(r1out, r1fn) ||
+        same_path_or_destination(r1out, r2fn) ||
+        same_path_or_destination(r1out, r3fn) ||
+        same_path_or_destination(r2out, r1fn) ||
+        same_path_or_destination(r2out, r2fn) ||
+        same_path_or_destination(r2out, r3fn) ||
+        same_path_or_destination(r1out, r2out)){
+        fprintf(stderr,
+            "ERROR: output FASTQ path resolves to an input or duplicate output; "
+            "choose a different --output_dir\n");
         exit(1);
     }
 
     gzFile outs[2];
     outs[0] = gzopen(r1out.c_str(), "w");
     outs[1] = gzopen(r2out.c_str(), "w");
+    if (outs[0] == NULL || outs[1] == NULL){
+        if (outs[0] != NULL){
+            gzclose(outs[0]);
+        }
+        if (outs[1] != NULL){
+            gzclose(outs[1]);
+        }
+        fprintf(stderr, "ERROR: unable to open output FASTQ files in %s\n", output_dir.c_str());
+        exit(1);
+    }
 
     bc_scanner scanner(r1fn, r2fn, r3fn);
     if (wl2fn != ""){

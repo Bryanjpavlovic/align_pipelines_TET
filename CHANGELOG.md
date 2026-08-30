@@ -5,6 +5,22 @@ documentation, and packaging changes relative to the supplied original
 `nkschaefer/align_pipelines` repository copies. It replaces the former RNA-only
 changelog and the historical `align_rna.nf` backup files.
 
+## 2026-08-30 — Restore historical 3′ TSO matching
+
+- Reverted the 3′ RNA front-adapter definition in
+  `scripts/mapping/integrated_RNA_trim_map_pipeline_V10.py` from the newly
+  anchored `TSO=^AAGCAGTGGTATCAACGCAGAGTACATGGG` form to the established V9
+  form, `^TSO=AAGCAGTGGTATCAACGCAGAGTACATGGG`.
+- In Cutadapt named-adapter syntax, the historical leading caret is part of the
+  adapter name rather than an anchor on the sequence. This intentionally
+  restores regular 5′ matching, including partial 5′ TSO occurrences permitted
+  by the existing minimum-overlap setting.
+- The anchored form was an unvalidated trimming-behavior change and was not
+  required for barcode-linked trimming QC. The aggregator already canonicalizes
+  the historical `^TSO` adapter name correctly.
+- No 5′ RNA adapter definitions, other trimming adapters, mapping behavior, QC,
+  plotting, orchestration, or workflow files changed in this correction.
+
 ## 2026-08-30 — Mapping control-layer migration
 
 - Moved the complete eight-file 10X RNA/ATAC mapping control layer from the

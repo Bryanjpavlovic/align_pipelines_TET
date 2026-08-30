@@ -32,7 +32,7 @@ from statistics import median
 from typing import Iterable, Sequence
 
 
-RELEASE = "2026-08-30-v17-align-repo-migration"
+RELEASE = "2026-08-30-v18-historical-tso-parity"
 ALIGN_PIPELINES_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RNA_WORKFLOW = str(ALIGN_PIPELINES_ROOT / "workflows" / "align_rna.nf")
 DEFAULT_RNA3_LIB_PREFIX = "Tet_2025_Multiome-RNA_"
@@ -191,7 +191,7 @@ def r2_adapter_lines(chemistry: str, paired: bool) -> list[str]:
     back = "-A" if paired else "-a"
     if chemistry == "3prime":
         adapters = [
-            (front, "TSO=^AAGCAGTGGTATCAACGCAGAGTACATGGG"),
+            (front, "^TSO=AAGCAGTGGTATCAACGCAGAGTACATGGG"),
             (back, "TSO_RC=CCCATGTACTCTGCGTTGATACCACTGCTT"),
         ]
     else:

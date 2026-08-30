@@ -10,9 +10,16 @@ if (!params.fasta){
 if (!params.genome_base){
     error("genome_base (Base name for reference files) required.")
 }
+if (params.memgb.toInteger() <= 1){
+    error("memgb must be greater than 1.")
+}
+if (params.threads.toInteger() < 1){
+    error("threads must be at least 1.")
+}
 
 process make_star_index{
     time '24h'
+    cpus params.threads
     memory params.memgb + ' GB'
     
     input:
@@ -39,7 +46,9 @@ process make_star_index{
         mv ${gtf} gtf_unzip.gtf
     fi
     
+    mkdir -p ${params.genome_base}
 STAR --runMode genomeGenerate \
+--runThreadN ${params.threads} \
 --sjdbGTFfile gtf_unzip.gtf \
 --genomeFastaFiles fasta_unzip.fa \
 --genomeDir ${params.genome_base} \
@@ -49,6 +58,7 @@ STAR --runMode genomeGenerate \
 
 process make_mm2_index{
     time '8h'
+    cpus params.threads
     
     input:
     file(fasta)
@@ -60,18 +70,18 @@ process make_mm2_index{
     
     script:
     """
-    minimap2 -d ${params.genome_base}.mm2 ${fasta}
+    minimap2 -t ${params.threads} -d ${params.genome_base}.mm2 ${fasta}
     """
 }
 
 workflow{
     if (params.gtf){
         // Build STAR reference
-        def star_dat = Channel.fromPath(params.fasta).combine(Channel.fromPath(params.gtf))
+        def star_dat = Channel.fromPath(params.fasta, checkIfExists: true)
+            .combine(Channel.fromPath(params.gtf, checkIfExists: true))
         make_star_index(star_dat)               
     }
     // Build minimap2 reference
-    def mm2_dat = Channel.fromPath(params.fasta)
+    def mm2_dat = Channel.fromPath(params.fasta, checkIfExists: true)
     make_mm2_index(mm2_dat)
 }
-

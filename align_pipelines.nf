@@ -10,6 +10,9 @@ include { call_variants } from './workflows/align_dna.nf'
 if (!params.output_directory){
     error("Output directory is required.")
 }
+if (!params.rg_metadata){
+    error("rg_metadata is required for RNA, ATAC, and DNA source FASTQ provenance.")
+}
 if (params.demux_species){
     if (params.rna_ref && !params.rna_ref_species){
         error("If using demux_species output, you must provide rna_ref_species instead of rna_ref")
@@ -42,6 +45,7 @@ process copy_species_files{
     
     script:
     """
+    true
     """
 }
 
@@ -54,15 +58,18 @@ workflow{
             align_atac_demux_species()
         } 
         
-        def species_files = Channel.fromPath("${params.demux_species}/*/species*").map{ fn -> 
-            spec = fn.toString().split('/')[-2]
+        def species_files = Channel.fromPath("${params.demux_species}/*/species*", checkIfExists: true).map{ fn ->
+            def spec = fn.toString().split('/')[-2]
             return [ spec, fn ]
         }
         copy_species_files(species_files)
     
     }
     else{
-        def libs = Channel.fromPath(params.libs).splitText().map{ id -> id.trim() }
+        def libs = Channel.fromPath(params.libs, checkIfExists: true)
+            .splitText()
+            .map{ id -> id.trim() }
+            .filter{ id -> id && !id.startsWith('#') }
         if (params.rna_ref){
             align_rna(libs)
         }

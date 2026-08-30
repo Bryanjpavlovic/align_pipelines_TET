@@ -28,6 +28,42 @@ if (params.atac_ref_species){
     }
 }
 
+// Load source-unit metadata: complete FASTQ basename -> minimap2 read-group line.
+// Collision-safe FASTQ names and this table are produced upstream.
+def rg_meta = [:]
+if (params.rg_metadata){
+    def first = true
+    new File(params.rg_metadata).eachLine { line ->
+        if (first) { first = false; return }  // skip header
+        def fields = line.split('\t')
+        // fields: fnbase, library, bp_id, sample_idx, lane, flowcell, lane_num, pu, rg_id, rg_string
+        if (fields.length >= 10){
+            rg_meta[fields[0]] = fields[9]
+        }
+    }
+}
+
+/**
+ * Strip optional __RunTag from a filename component before extracting
+ * the library name. Upstream consolidation appends the run tag as
+ * __Run001 between _S##_L## and _R#_.
+ *
+ * After NF regex extracts match[2] (everything before _R3):
+ *   Tet_2025_Multiome-ATAC_3_S3_L002__Run001 -> Tet_2025_Multiome-ATAC_3_S3_L002
+ *   Tet_2025_Multiome-ATAC_3_S3_L002         -> Tet_2025_Multiome-ATAC_3_S3_L002
+ *
+ * fnbase keeps the full name (with run tag) as the exact metadata key.
+ */
+def strip_run_tag(s){
+    return s.replaceFirst(/__Run\d+$/, '')
+}
+
+/** Canonicalize legacy and bcl-convert names with trailing _L# annotations. */
+def canonical_library_name(s){
+    def before_sample = strip_run_tag(s).replaceFirst(/_S\d+_L\d+$/, '')
+    return before_sample.replaceFirst(/(?:_L\d+)+$/, '')
+}
+
 process preproc_atac_files{
     time '24h'
     
@@ -90,6 +126,7 @@ process align_atac_files{
     input:
     tuple val(lib),
     val(basename),
+    val(rg_string),
     val(num),
     file(idx),
     file(r1),
@@ -100,7 +137,7 @@ process align_atac_files{
 
     script:
     """
-    minimap2 -t ${params.threads} -y -a -x sr -R "@RG\\tID:${basename}\\tSM:${lib}\\tPL:Illumina" ${idx} ${r1} ${r2} \
+    minimap2 -t ${params.threads} -y -a -x sr -R "${rg_string}" ${idx} ${r1} ${r2} \
 | samtools sort -n - | samtools fixmate -m - - | samtools sort -o ${basename}_${num}_sorted.bam
     samtools index ${basename}_${num}_sorted.bam    
     """    
@@ -213,7 +250,7 @@ def peek_check_bc(filePath){
             line = new BufferedReader(reader).readLine()        
         }
     }
-    lnsplit = line.split(' ')
+    def lnsplit = line.split(' ')
     if ( lnsplit[-1] ==~ /^CB:Z:[ACGT]+$/){
         return true
     }
@@ -230,6 +267,9 @@ workflow align_atac_demux_species{
     }
     if (!params.demux_species){
         error("demux_species output dir is required")
+    }
+    if (!params.rg_metadata){
+        error("rg_metadata is required; source FASTQ provenance may not be omitted")
     }
     
     def atac_triples = Channel.fromPath("${params.demux_species}/*/*/ATAC*_R3*.fastq.gz").map{ fn -> 
@@ -286,7 +326,15 @@ workflow align_atac_demux_species{
         return peek_check_bc(r1) && peek_check_bc(r2)
     }
     
-    atac_bams = atac_preproc1.concat(atac_pairs) | align_atac_files
+    atac_bams = atac_preproc1.concat(atac_pairs).map{ tup ->
+        def lib = tup[0]
+        def fsub = tup[1]
+        if (!rg_meta.containsKey(fsub)){
+            error("Missing ATAC read-group metadata for input unit: " + fsub)
+        }
+        def rg = rg_meta[fsub]
+        [lib, fsub, rg, 0, tup[-1], tup[2], tup[3]]
+    } | align_atac_files
     
     atac_bams.groupTuple() | cat_atac_bams | atac_mkdup | atac_namesort | atac_fragments
 }
@@ -320,6 +368,9 @@ workflow align_atac{
     if (!params.atac_dir){
         error("ATAC reads directory is required")
     }
+    if (!params.rg_metadata){
+        error("rg_metadata is required; source FASTQ provenance may not be omitted")
+    }
     if (params.num_chunks < 2){
         error("num_chunks must be at least 2")
     }
@@ -327,10 +378,12 @@ workflow align_atac{
     def idx_atac = Channel.fromPath(params.atac_ref)
     
     // Get non-preprocessed files
+    // strip_run_tag removes an optional __Run001 tag before library name extraction.
+    // fnbase keeps the full name (with run tag) as the exact metadata key.
     def atac_triples = libs.cross(Channel.fromPath("${params.atac_dir}/*_R3*.fastq.gz").map{ fn ->
         def r3 = fn.toString().trim()
         def match = (r3 =~ /(.*)\/(.*)\_R3(_\d+)?\.(fastq|fq)(\.gz)?/)[0]
-        def libname_atac = match[2].replaceFirst(/_S(\d+)_L(\d+)/, '')
+        def libname_atac = canonical_library_name(match[2])
         def dirn = ""
         if (match[1] != null && match[1] != ""){
             dirn += match[1] + '/'
@@ -366,9 +419,10 @@ workflow align_atac{
     } 
     
     // Get pre-processed files
+    // Same strip_run_tag logic for already-preprocessed files
     def atac_pairs = libs.cross(
         Channel.fromFilePairs("${params.atac_dir}/*_S*L*_R{1,2}*.fastq.gz").map{ id, reads ->
-        [ atac_map[id.replaceFirst(/_S(\d+)_L(\d+)/, '')], id, reads[0], reads[1]]
+        [ atac_map[canonical_library_name(id)], id, reads[0], reads[1]]
     }).map{ lib, tup -> tup }.filter{ lib, fnbase, r1, r2 ->
         return peek_check_bc(r1) && peek_check_bc(r2)
     }
@@ -376,7 +430,11 @@ workflow align_atac{
     
     atac_bams = split_reads_atac(atac_preproc1.concat(atac_preproc2)).flatMap{ 
         ln, fsub, idx, files1, files2 ->
-            files2.indices.collect{ i -> [ln, fsub, i, idx, files1[i], files2[i]] }
+            if (!rg_meta.containsKey(fsub)){
+                error("Missing ATAC read-group metadata for input unit: " + fsub)
+            }
+            def rg = rg_meta[fsub]
+            files2.indices.collect{ i -> [ln, fsub, rg, i, idx, files1[i], files2[i]] }
     } | align_atac_files
 
     atac_bams.groupTuple() | cat_atac_bams | atac_mkdup | atac_namesort | atac_fragments

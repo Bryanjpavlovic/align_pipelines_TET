@@ -2,6 +2,32 @@
 import java.util.zip.GZIPInputStream
 import java.nio.file.Files
 
+// Load source-unit metadata: complete FASTQ basename -> minimap2 read-group line.
+// Collision-safe FASTQ names and this table are produced upstream.
+def rg_meta = [:]
+if (params.rg_metadata){
+    def first = true
+    new File(params.rg_metadata).eachLine { line ->
+        if (first) { first = false; return }  // skip header
+        def fields = line.split('\t')
+        // fields: fnbase, library, bp_id, sample_idx, lane, flowcell, lane_num, pu, rg_id, rg_string
+        if (fields.length >= 10){
+            rg_meta[fields[0]] = fields[9]
+        }
+    }
+}
+
+/** Strip an optional upstream collision-avoidance run tag. */
+def strip_run_tag(s){
+    return s.replaceFirst(/__Run\d+$/, '')
+}
+
+/** Canonicalize legacy and bcl-convert names with trailing _L# annotations. */
+def canonical_library_name(s){
+    def before_sample = strip_run_tag(s).replaceFirst(/_S\d+_L\d+$/, '')
+    return before_sample.replaceFirst(/(?:_L\d+)+$/, '')
+}
+
 process align_dna_files{
     time { 36.hour * task.attempt }
     cpus params.threads
@@ -12,6 +38,7 @@ process align_dna_files{
     input:
     tuple val(lib),
     val(basename),
+    val(rg_string),
     val(num),
     file(r1),
     file(r2),
@@ -23,7 +50,7 @@ process align_dna_files{
 
     script:
     """
-    minimap2 -t ${params.threads} -a -x sr -R "@RG\\tID:${basename}\\tSM:${lib}\\tPL:Illumina" ${idx} ${r1} ${r2} \
+    minimap2 -t ${params.threads} -a -x sr -R "${rg_string}" ${idx} ${r1} ${r2} \
 | samtools sort -n - | samtools fixmate -m - - | samtools sort -o ${basename}_${num}_sorted.bam
     samtools index ${basename}_${num}_sorted.bam    
     """    
@@ -110,7 +137,11 @@ process varcall{
     for bam in ${bams}; do
         echo \$bam >> bamlist.txt
     done
-    zcat ${fa} > genome.fa
+    if [ \$( file -L --mime-type -b ${fa} | grep "gzip" | wc -l ) -gt 0 ]; then
+        zcat ${fa} > genome.fa
+    else
+        cp ${fa} genome.fa
+    fi
     samtools faidx genome.fa
     freebayes -f genome.fa -L bamlist.txt -t ${bed} --use-best-n-alleles 4 --min-alternate-count 4 > ${bed}.vcf
     """
@@ -220,16 +251,17 @@ workflow call_variants{
     if (!params.dna_dir){
         error("Genomic DNA reads directory is required")
     }
+    if (!params.rg_metadata){
+        error("rg_metadata is required; source FASTQ provenance may not be omitted")
+    }
     
-    def fa_genome = Channel.fromPath(params.dna_ref) | mm2_idx
-    
-    libs.collect().map{ it as Set }.set{ lib_set }
+    def fa_genome = Channel.fromPath(params.dna_ref, checkIfExists: true) | mm2_idx
     
     // Get FASTQ file names
-    def dna_pairs = Channel.fromPath("${params.dna_dir}/*_R1*.fastq.gz").map{ fn -> 
+    def dna_pairs = libs.cross(Channel.fromPath("${params.dna_dir}/*_R1*.fastq.gz", checkIfExists: true).map{ fn ->
         def r1 = fn.toString().trim()
         def match = (r1 =~ /(.*)\/(.*)\_R1(_\d+)?\.(fastq|fq)(\.gz)?/)[0]
-        def libname = match[2].replaceFirst(/_S(\d+)_L(\d+)/, '')
+        def libname = canonical_library_name(match[2])
         def dirn = ""
         if (match[1] != null && match[1] != ""){
             dirn += match[1] + '/'
@@ -245,14 +277,14 @@ workflow call_variants{
         def r2 = dirn + match[2] + "_R2" + end + '.' + match[4] + gz
         def fnbase = match[2]
         return [ libname, fnbase, file(r1), file(r2)]
-    }.filter{
-        item -> 
-        def (key, _) = item
-        lib_set.contains(item)
-    }
+    }).map{ lib, tup -> tup }
 
-    dna_bams = split_reads(dna_pairs).flatMap{ ln, fsub, files1, files2 -> 
-        files1.indices.collect{ i -> [ln, fsub, i, files1[i], files2[i]] }
+    dna_bams = split_reads(dna_pairs).flatMap{ ln, fsub, files1, files2 ->
+        if (!rg_meta.containsKey(fsub)){
+            error("Missing DNA read-group metadata for input unit: " + fsub)
+        }
+        def rg = rg_meta[fsub]
+        files1.indices.collect{ i -> [ln, fsub, rg, i, files1[i], files2[i]] }
     }.combine(fa_genome) | align_dna_files
 
     bams_mkdup = dna_bams.groupTuple() | cat_dna_bams | dna_mkdup
@@ -264,7 +296,7 @@ workflow call_variants{
     }
     
     // Extract BED files for breaking up genomic seqs (to run var calling in parallel)
-    beds = split_fai_regions(Channel.fromPath(params.dna_ref)).flatMap{ fa, bedlist -> 
+    beds = split_fai_regions(Channel.fromPath(params.dna_ref, checkIfExists: true)).flatMap{ fa, bedlist ->
         bedlist.collect{ bed -> [ fa, bed ] }
     } 
     vcfs = varcall(bamslist.collect().toList().combine(baislist.collect().toList()).combine(beds))

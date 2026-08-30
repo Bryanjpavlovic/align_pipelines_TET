@@ -8,6 +8,45 @@ if (params.rna_ref_species){
     }
 }
 
+// Load source-unit metadata: complete FASTQ basename -> STAR read-group fields.
+// Collision-safe FASTQ names and this table are produced upstream.
+def rg_meta = [:]
+if (params.rg_metadata){
+    def first = true
+    new File(params.rg_metadata).eachLine { line ->
+        if (first) { first = false; return }  // skip header
+        def fields = line.split('\t')
+        // fields: fnbase, library, bp_id, sample_idx, lane, flowcell, lane_num, pu, rg_id, rg_string
+        if (fields.length >= 10){
+            // For STAR, store the individual RG fields (not the full @RG\t string)
+            // STAR --outSAMattrRGline wants: ID:xxx SM:xxx PL:xxx PU:xxx DS:xxx
+            rg_meta[fields[0]] = "ID:${fields[8]} SM:${fields[1]} PL:Illumina PU:${fields[7]} DS:${fields[2]}"
+        }
+    }
+}
+
+/**
+ * Strip optional __RunTag from a filename component before extracting
+ * the library name.
+ */
+def strip_run_tag(s){
+    return s.replaceFirst(/__Run\d+$/, '')
+}
+
+/**
+ * Canonicalize both legacy names (..._19_S3_L001) and bcl-convert names
+ * carrying pre-sample annotations (..._19_L1_L2_S3_L001).
+ */
+def canonical_library_name(s){
+    def before_sample = strip_run_tag(s).replaceFirst(/_S\d+_L\d+$/, '')
+    return before_sample.replaceFirst(/(?:_L\d+)+$/, '')
+}
+
+def rna_geometry = params.rna_geometry ?: 'long-r2'
+if (!(rna_geometry in ['long-r2', 'pe150'])){
+    error("rna_geometry must be long-r2 or pe150; received: " + rna_geometry)
+}
+
 process map_rna{
     cpus params.threads
     time { 120.hour * task.attempt }
@@ -20,6 +59,7 @@ process map_rna{
     tuple val(lib),
         file(reads1),
         file(reads2),
+        val(basenames),
         val(refname),
         file(ref),
         file(whitelist)
@@ -28,14 +68,15 @@ process map_rna{
 
     output:
     tuple val(lib),
-        file("gex.bam"),
-        file("gex.bam.bai"),
-        file("Barcodes.stats"),
-        file("Features.stats"),
-        file("Summary.csv"),
-        file("UMIperCellSorted.txt"),
-        file("raw/*"),
-        file("filtered/*")
+        path("gex.bam"),
+        path("gex.bam.bai"),
+        path("Barcodes.stats"),
+        path("Features.stats"),
+        path("Summary.csv"),
+        path("UMIperCellSorted.txt"),
+        path("raw/*"),
+        path("filtered/*"),
+        path("*Unmapped.out.mate*", optional: true)
 
     script:
     def reftrunc = refname.split('/')[-1]    
@@ -43,6 +84,19 @@ process map_rna{
     def r2 = reads2.join(',')
     def lib2 = lib.replace('/', '_')
     def sortmem = (params.memgb.toInteger() - 1) * 1024 * 1024 * 1024
+    def missing_rg = basenames.findAll{ bn -> !rg_meta.containsKey(bn) }
+    if (missing_rg){
+        error("Missing RNA read-group metadata for input unit(s): " + missing_rg.join(', '))
+    }
+    def rgline = basenames.collect{ bn -> rg_meta[bn] }.join(' , ')
+    // Standard 10X uses a separate, final barcode read: cDNA R2 then barcode R1.
+    // 5' PE150 embeds CB16+UMI12 in mate 1. Upstream trimming removes the internal
+    // TSO, so STAR clips only the retained 28 bp barcode block and
+    // aligns the downstream R1 cDNA together with R2.
+    def readfiles = rna_geometry == 'pe150' ? "${r1} ${r2}" : "${r2} ${r1}"
+    def geometry_args = (rna_geometry == 'pe150'
+        ? '--soloBarcodeMate 1 --clip5pNbases 28 0'
+        : '--soloBarcodeMate 0')
     """
     if [ ! -d ${reftrunc} ]; then
         mkdir ${reftrunc}
@@ -54,33 +108,35 @@ process map_rna{
         cp ${whitelist} wl_unzip.txt
     fi
 
-STAR --genomeDir ${reftrunc} \
- --runThreadN ${params.threads} \
- --readFilesIn ${r2} ${r1} \
- --readFilesCommand zcat \
- --clip3pAdapterSeq polyA \
- --clip3pAdapterMMp 0.1 \
- --outBAMsortingThreadN 1 \
- --limitBAMsortRAM ${sortmem} \
- --outFileNamePrefix ${lib2} \
- --outSAMattributes NH HI AS nM CR CY UR UY GX GN CB UB \
- --outSAMtype BAM SortedByCoordinate \
- --outSAMunmapped Within \
- --soloType CB_UMI_Simple \
- --soloCBstart 1 \
- --soloCBlen 16 \
- --soloUMIstart 17 \
- --soloUMIlen 12 \
- --soloCBwhitelist wl_unzip.txt \
- --outFilterScoreMin 30 \
- --soloCBmatchWLtype 1MM_multi_Nbase_pseudocounts \
- --soloUMIfiltering MultiGeneUMI_CR \
- --soloUMIdedup 1MM_CR \
- --soloCellFilter EmptyDrops_CR \
- --soloBarcodeReadLength 0 \
- --limitSjdbInsertNsj 5000000 \
- --soloFeatures GeneFull_Ex50pAS \
- --soloMultiMappers EM 
+    STAR --genomeDir ${reftrunc} \
+     --runThreadN ${params.threads} \
+     --readFilesIn ${readfiles} \
+     --readFilesCommand zcat \
+     --clipAdapterType CellRanger4 \
+     --outBAMsortingThreadN 1 \
+     --limitBAMsortRAM ${sortmem} \
+     --outFileNamePrefix ${lib2} \
+     --outSAMattributes NH HI AS nM CR CY UR UY GX GN CB UB \
+     --outSAMtype BAM SortedByCoordinate \
+     --outSAMattrRGline ${rgline} \
+     --soloType CB_UMI_Simple \
+     --soloCBstart 1 \
+     --soloCBlen 16 \
+     --soloUMIstart 17 \
+     --soloUMIlen 12 \
+     ${geometry_args} \
+     --soloCBwhitelist wl_unzip.txt \
+     --outFilterScoreMinOverLread 0.33 \
+     --outFilterMatchNminOverLread 0.33 \
+     --soloCBmatchWLtype 1MM_multi_Nbase_pseudocounts \
+     --soloUMIfiltering MultiGeneUMI_CR \
+     --soloUMIdedup 1MM_CR \
+     --soloCellFilter EmptyDrops_CR \
+     --soloBarcodeReadLength 0 \
+     --limitSjdbInsertNsj 5000000 \
+     --soloFeatures GeneFull_Ex50pAS \
+     --soloMultiMappers EM \
+     --outReadsUnmapped Fastx
 
     mv ${lib2}Aligned.sortedByCoord.out.bam gex.bam
     samtools index gex.bam
@@ -92,8 +148,13 @@ STAR --genomeDir ${reftrunc} \
     gzip ${lib2}Solo.out/GeneFull_Ex50pAS/raw/*
     mv ${lib2}Solo.out/GeneFull_Ex50pAS/filtered .
     mv ${lib2}Solo.out/GeneFull_Ex50pAS/raw .
-
-# --clipAdapterType CellRanger4
+    
+    if [ -f ${lib2}Unmapped.out.mate1 ]; then
+        mv ${lib2}Unmapped.out.mate1 Unmapped.out.mate1
+    fi
+    if [ -f ${lib2}Unmapped.out.mate2 ]; then
+        mv ${lib2}Unmapped.out.mate2 Unmapped.out.mate2
+    fi
     """
 }
 
@@ -109,6 +170,9 @@ workflow align_rna_demux_species{
     if (!params.rna_whitelist){
         error("rna_whitelist is required")
     }
+    if (!params.rg_metadata){
+        error("rg_metadata is required; source FASTQ provenance may not be omitted")
+    }
     
     def read_pairs = Channel.fromFilePairs("${params.demux_species}/*/*/GEX_*_S*L*_R{1,2}*.fastq.gz").map{ id, reads ->
         def libn = reads[0].toString().split('/')[-3]
@@ -116,15 +180,15 @@ workflow align_rna_demux_species{
         if (! rna_ref_map[species]){
             error("Species " + species + " does not have an RNA-seq reference specified")
         }
-        [libn + "/" + species, reads, rna_ref_map[species], file(rna_ref_map[species] + "/*") ]
-    }.groupTuple().map{ lib, reads, refname, ref ->
+        [libn + "/" + species, id, reads, rna_ref_map[species], file(rna_ref_map[species] + "/*") ]
+    }.groupTuple().map{ lib, ids, reads, refname, ref ->
         def r1s = []
         def r2s = []
         for (elt in reads){
             r1s.add(elt[0])
             r2s.add(elt[1])    
         }
-        return [lib, r1s, r2s, refname[0], ref[0] ]
+        return [lib, r1s, r2s, ids, refname[0], ref[0] ]
     }.combine(Channel.fromPath(params.rna_whitelist))
     map_rna(read_pairs)
 }
@@ -144,22 +208,24 @@ workflow align_rna{
     if (!params.rna_dir){
         error("RNA directory is required")
     }
+    if (!params.rg_metadata){
+        error("rg_metadata is required; source FASTQ provenance may not be omitted")
+    }
     
     def rna_idx = Channel.fromPath("${params.rna_ref}/**").collect().map{ x -> 
         [params.rna_ref, x]}
     
     def read_pairs = Channel.fromFilePairs("${params.rna_dir}/*_S*L*_R{1,2}*.fastq.gz").map{ id, reads ->
-        [id.replaceFirst(/_S(\d+)_L(\d+)/, ''), reads]
-    }.groupTuple().map{ lib, reads ->
+        [canonical_library_name(id), id, reads]
+    }.groupTuple().map{ lib, ids, reads ->
         def r1s = []
         def r2s = []
         for (elt in reads){
             r1s.add(elt[0])
             r2s.add(elt[1])    
         }
-        return [lib, r1s, r2s]
+        return [lib, r1s, r2s, ids]
     }
     
     map_rna(libs.cross(read_pairs).map{ lib, tup -> tup }.combine(rna_idx).combine(Channel.fromPath(params.rna_whitelist)))
-    
 }

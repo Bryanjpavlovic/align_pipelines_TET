@@ -17,6 +17,7 @@ history relative to the supplied original repository copies.
 - `workflows/align_rna.nf`: STARsolo RNA mapping
 - `workflows/align_atac.nf`: barcode preprocessing and minimap2 ATAC mapping
 - `workflows/align_dna.nf`: minimap2 DNA mapping and FreeBayes calling
+- `scripts/mapping/`: 10X RNA/ATAC staging, mapping, QC, and plotting control layer
 - `examples/`: parameter-file templates
 
 ## Cluster deployment
@@ -34,12 +35,32 @@ PIPELINE_DIR="${ALIGN_PIPELINES_HOME:-/nvme/software/packages/align_pipelines/bj
 
 The deployment directory must contain the compiled helper programs
 `atac_fq_preprocess`, `split_read_files`, and `vcf_depth_filter` in addition to
-the scripts listed above.
+the scripts listed above. Install the Python mapping control layer under
+`$PIPELINE_DIR/bin/mapping`; it is part of this repository and is no longer
+installed by CellBouncer.
 
 For a standalone source build, install the bioinformatics tools used by the
 workflows, make the `htswrapper` dependency available at
 `dependencies/htswrapper`, and run `make`. The Makefile uses C++11 and links
 against zlib and htslib.
+
+## 10X mapping orchestration and QC
+
+The high-level 10X runner is:
+
+```bash
+python3 "$PIPELINE_DIR/bin/mapping/orchestrate_10x_mapping_qc.py" --help
+```
+
+Its seven helpers are installed beside it. From the source checkout, the same
+runner can be invoked from `scripts/mapping/orchestrate_10x_mapping_qc.py`.
+Both layouts resolve helper scripts from the runner's directory and resolve
+`align_rna.nf` and `align_atac.nf` from the repository/package `workflows/`
+directory. The orchestrator retains explicit override options for unusual
+layouts, but the standard source and installed layouts need none.
+
+The old `mapping/NextflowConfigs` copy is not part of the finalized layout.
+Top-level configuration files and `workflows/` are the authoritative copies.
 
 ## Required source-unit metadata
 

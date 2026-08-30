@@ -52,7 +52,19 @@ For RNA, set `rna_geometry` to:
 - `long-r2` for the standard separate R1 barcode/UMI read and R2 cDNA layout;
 - `pe150` for CB16+UMI12 embedded in mate 1 followed by retained R1 cDNA.
 
-## 4. Submit the Nextflow controller through SLURM
+## 4. Use the bundled 10X mapping orchestrator
+
+For staged 10X RNA/ATAC trimming, mapping, QC, plotting, and validation, use:
+
+```bash
+python3 "$PIPELINE_DIR/bin/mapping/orchestrate_10x_mapping_qc.py" --help
+```
+
+The orchestrator and all seven runtime helpers now belong to this repository.
+They are installed together below `$PIPELINE_DIR/bin/mapping` and resolve the
+RNA/ATAC workflows from `$PIPELINE_DIR/workflows` automatically.
+
+## 5. Submit the Nextflow controller through SLURM
 
 If your cluster policy requires the Nextflow controller itself to run as a
 SLURM job, create `submit_align.sbatch`:
@@ -86,15 +98,17 @@ sbatch submit_align.sbatch
 
 The SLURM overlay limits Nextflow to ten active tasks and ten submissions per
 minute. Those settings throttle Nextflow tasks; they do not control SLURM array
-concurrency in the separate CellBouncer mapping orchestrator.
+concurrency. The bundled mapping orchestrator provides
+`--array-max-concurrent` for its arrays and `--max-cores` for its supported
+RNA-only total-core ceiling.
 
-## 5. Resume and clean up
+## 6. Resume and clean up
 
 Resume is enabled by the supplied SLURM overlay. You may also pass `-resume`
 explicitly. Do not delete the run's `work/` directory until the run is complete
 and you no longer need its resume cache.
 
-## Supplied parameter templates
+## 7. Supplied parameter templates
 
 - `examples/example.yml`: combined RNA, ATAC, and DNA template
 - `examples/example_call_vars.yml`: DNA mapping and variant calling

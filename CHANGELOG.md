@@ -5,6 +5,33 @@ documentation, and packaging changes relative to the supplied original
 `nkschaefer/align_pipelines` repository copies. It replaces the former RNA-only
 changelog and the historical `align_rna.nf` backup files.
 
+## 2026-08-30 — Mapping control-layer migration
+
+- Moved the complete eight-file 10X RNA/ATAC mapping control layer from the
+  CellBouncer source/deployment layout into `scripts/mapping` in this
+  repository. The installed layout is now `bin/mapping` below the deployed
+  align_pipelines package.
+- Kept the orchestrator and its seven runtime helpers together so sibling
+  driver, aggregation, QC, and plotting resources continue to resolve without
+  additional command-line configuration.
+- Changed the orchestrator and RNA/ATAC drivers to derive `align_rna.nf` and
+  `align_atac.nf` from the containing repository/package root. This supports
+  both `scripts/mapping` in the source checkout and `bin/mapping` in the
+  installed package while eliminating hard-coded ownership by the CellBouncer
+  deployment tree.
+- Changed standalone ATAC QC job generation to embed the collector's actual
+  source or installed path instead of the former copied path in the production
+  mapping-output directory.
+- Retired the duplicate `mapping/NextflowConfigs` deployment model. The
+  repository's top-level `.nf`/configuration files and `workflows/` directory
+  are the only authoritative workflow copies.
+- Updated the Nextflow manifest homepage to the
+  `Bryanjpavlovic/align_pipelines_TET` fork and retained original and fork
+  authorship.
+- This migration changes code ownership and resource discovery; it does not
+  alter the established trimming, alignment, barcode aggregation, QC, plotting,
+  resume, node-placement, or array-throttling behavior of the migrated scripts.
+
 ## 2026-08-30 — Final workflow consolidation
 
 ### Shared source-FASTQ provenance

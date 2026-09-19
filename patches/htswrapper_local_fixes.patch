@@ -1,0 +1,25 @@
+diff --git a/src/bc.cpp b/src/bc.cpp
+index 0383a71..2f3c1e6 100644
+--- a/src/bc.cpp
++++ b/src/bc.cpp
+@@ -955,6 +955,9 @@ bool bc_whitelist::mutate(const char* str, int len, bool rc, vector<unsigned lon
+     if (this->exact_only){
+         return true;
+     }
++    if (str == NULL || bc_len <= 0 || len < bc_len){
++        return false;
++    }
+ 
+     char strcpy[bc_len+1];
+     strcpy[bc_len] = '\0';
+@@ -988,6 +991,10 @@ bool bc_whitelist::mutate(const char* str, int len, bool rc, vector<unsigned lon
+         }
+     }
+ 
++    if (npos < 0){
++        return false;
++    }
++
+     strcpy[npos] = 'A';
+     if (rc){
+         str2bc_rc(strcpy, cur_bc, bc_len);

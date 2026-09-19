@@ -101,8 +101,8 @@ void read_vcf(string& filename,
             int nmiss = 0;
             int num_loaded = bcf_get_genotypes(bcf_header, bcf_record, &gts, &n_gts);
             if (num_loaded <= 0){
-                fprintf(stderr, "ERROR loading genotypes at %s %d\n", 
-                    chrom.c_str(), bcf_record->pos);
+                fprintf(stderr, "ERROR loading genotypes at %s %lld\n", 
+                    chrom.c_str(), static_cast<long long>(bcf_record->pos));
                 exit(1);
             }
             
@@ -185,7 +185,7 @@ void read_vcf(string& filename,
         }
         ++nvar;
         if (nvar % 5000 == 0){
-            fprintf(stderr, "Processed %d variants\r", nvar);
+            fprintf(stderr, "Processed %ld variants\r", nvar);
         }
     }
     fprintf(stderr, "Processed %ld variants\n", nvar);
@@ -479,16 +479,16 @@ void filter_vcf(string& filename, string& outfile,
             //free(gts);
         }
         if (nvar % 5000 == 0){
-            fprintf(stderr, "Processed %d variants\r", nvar);
+            fprintf(stderr, "Processed %ld variants\r", nvar);
         }
     }
-    fprintf(stderr, "Processed %d variants\n", nvar);
-    fprintf(stderr, "%d of %d variants removed - not biallelic\n", n_multi_fail, nvar);
-    fprintf(stderr, "%d of %d variants removed - indels\n", n_indel_fail, nvar);
-    fprintf(stderr, "%d of %d variants removed for failing variant quality filter\n",
+    fprintf(stderr, "Processed %ld variants\n", nvar);
+    fprintf(stderr, "%d of %ld variants removed - not biallelic\n", n_multi_fail, nvar);
+    fprintf(stderr, "%d of %ld variants removed - indels\n", n_indel_fail, nvar);
+    fprintf(stderr, "%d of %ld variants removed for failing variant quality filter\n",
         n_qual_fail, nvar);
-    fprintf(stderr, "%d of %d variants removed for failing HWE test\n", n_hardy_fail, nvar);
-    fprintf(stderr, "%d of %d variants removed due to fraction of missing genotypes\n", n_miss_fail, nvar);
+    fprintf(stderr, "%d of %ld variants removed for failing HWE test\n", n_hardy_fail, nvar);
+    fprintf(stderr, "%d of %ld variants removed due to fraction of missing genotypes\n", n_miss_fail, nvar);
     fprintf(stderr, "%d of %d kept sites had genotypes removed for failing depth filters\n", n_depth_fail, 
         nvar_pass);
     fprintf(stderr, "%d of %d kept sites had genotypes removed for failing genotype quality filter\n", 

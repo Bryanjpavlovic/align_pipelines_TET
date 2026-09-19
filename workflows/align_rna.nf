@@ -42,6 +42,26 @@ def canonical_library_name(s){
     return before_sample.replaceFirst(/(?:_L\d+)+$/, '')
 }
 
+/**
+ * Size RNA mapping memory from the compressed, trimmed FASTQs.
+ *
+ * The upper-envelope model was calibrated from 36 completed TET libraries:
+ *     peak GiB <= 4 + 0.224 * trimmed FASTQ GiB
+ *
+ * The initial allocation adds 25% operational headroom and rounds upward to
+ * an 8 GiB scheduling bucket. params.memgb remains an explicit floor, and an
+ * OOM retry adds 32 GiB without changing the underlying mapping inputs.
+ */
+def rna_memory_request(reads1, reads2, minimum_gb, attempt){
+    def bytes_per_gib = 1024d * 1024d * 1024d
+    def trimmed_gib = (reads1 + reads2).collect{ read -> read.size() }.sum() / bytes_per_gib
+    def upper_envelope_gb = 4d + (0.224d * trimmed_gib)
+    def calibrated_gb = Math.ceil((1.25d * upper_envelope_gb) / 8d) * 8d
+    def initial_gb = Math.max(minimum_gb.toString().toDouble(), calibrated_gb)
+    def requested_gb = initial_gb + (32d * (attempt.toInteger() - 1))
+    return "${requested_gb.toInteger()} GB"
+}
+
 def rna_geometry = params.rna_geometry ?: 'long-r2'
 if (!(rna_geometry in ['long-r2', 'pe150'])){
     error("rna_geometry must be long-r2 or pe150; received: " + rna_geometry)
@@ -50,7 +70,7 @@ if (!(rna_geometry in ['long-r2', 'pe150'])){
 process map_rna{
     cpus params.threads
     time { 120.hour * task.attempt }
-    memory params.memgb + ' GB'
+    memory { rna_memory_request(reads1, reads2, params.memgb, task.attempt) }
     
     errorStrategy { task.exitStatus in 137..140 ? 'retry' : 'terminate' }
     maxRetries 3
@@ -74,6 +94,10 @@ process map_rna{
         path("Features.stats"),
         path("Summary.csv"),
         path("UMIperCellSorted.txt"),
+        path("CellReads.stats.gz"),
+        path("STAR_Log.out"),
+        path("STAR_Log.final.out"),
+        path("STAR_SJ.out.tab.gz"),
         path("raw/*"),
         path("filtered/*"),
         path("*Unmapped.out.mate*", optional: true)
@@ -132,6 +156,7 @@ process map_rna{
      --soloUMIfiltering MultiGeneUMI_CR \
      --soloUMIdedup 1MM_CR \
      --soloCellFilter EmptyDrops_CR \
+     --soloCellReadStats Standard \
      --soloBarcodeReadLength 0 \
      --limitSjdbInsertNsj 5000000 \
      --soloFeatures GeneFull_Ex50pAS \
@@ -144,6 +169,10 @@ process map_rna{
     cp ${lib2}Solo.out/GeneFull_Ex50pAS/Features.stats .
     cp ${lib2}Solo.out/GeneFull_Ex50pAS/Summary.csv .
     cp ${lib2}Solo.out/GeneFull_Ex50pAS/UMIperCellSorted.txt .
+    gzip -c ${lib2}Solo.out/GeneFull_Ex50pAS/CellReads.stats > CellReads.stats.gz
+    mv ${lib2}Log.out STAR_Log.out
+    mv ${lib2}Log.final.out STAR_Log.final.out
+    gzip -c ${lib2}SJ.out.tab > STAR_SJ.out.tab.gz
     gzip ${lib2}Solo.out/GeneFull_Ex50pAS/filtered/*
     gzip ${lib2}Solo.out/GeneFull_Ex50pAS/raw/*
     mv ${lib2}Solo.out/GeneFull_Ex50pAS/filtered .

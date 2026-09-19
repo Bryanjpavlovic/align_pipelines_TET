@@ -1,0 +1,4 @@
+contig	species	mitochondrial	rrna	reference_class
+chr1	fixture_species	0	0	nuclear
+chrM	fixture_species	1	0	mitochondrial
+rRNA1	fixture_species	0	1	rrna

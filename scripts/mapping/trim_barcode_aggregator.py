@@ -8,12 +8,13 @@ for the master data. An empty-drop view is produced only when an explicit
 library/barcode roster is supplied. A barcode not called as a STARsolo cell is
 not automatically labelled as an empty drop.
 
-When a STARsolo BAM is present, its observed ``CR`` -> final ``CB`` mapping is
-authoritative. Conflicting raw-barcode corrections are resolved with the exact
-BAM read name rather than guessed. Reads whose raw barcode is absent from the
-mapped-read BAM use the conservative exact/unique one-mismatch whitelist
-fallback. Ambiguous and uncorrectable reads remain reconciled in the QC
-counters but are not silently assigned.
+When a profiler ``raw_to_corrected_barcode_counts.tsv.gz`` bridge is present,
+its observed ``CR`` -> final ``CB`` mapping is authoritative and no BAM is
+opened. The manifest's exact RG resolves differences between source FASTQs;
+conflicts within one RG are reported and left unresolved, never guessed. The
+historical BAM lookup remains a fallback for runs without the bridge. Reads
+whose raw barcode is absent from either evidence source use the conservative
+exact/unique one-mismatch whitelist fallback.
 
 Source-level tables retain the BAM read-group ID and exact source FASTQ for
 each aggregate. This preserves source provenance without a prohibitively large
@@ -36,7 +37,7 @@ from pathlib import Path
 from typing import Callable, Iterator, TextIO
 
 
-RELEASE = "2026-08-24-v8-observed-round-progression"
+RELEASE = "2026-09-05-v9-profiler-barcode-bridge"
 FRONT_ADAPTERS = {"TSO", "TSO_5prime_marker", "TSO_5prime_marker_RC"}
 MANIFEST_REQUIRED = {
     "library",
@@ -49,6 +50,7 @@ MANIFEST_REQUIRED = {
 }
 MANIFEST_OPTIONAL = {
     "bam",
+    "barcode_correction_bridge",
     "rg_metadata",
     "source_id",
     "source_fastq",
@@ -110,6 +112,8 @@ class BarcodeAnnotation:
 @dataclass
 class StarsoloCBMap:
     bam: Path
+    source_kind: str
+    rg_filter: str | None
     assignments: dict[str, str]
     conflicts: set[str]
     conflict_read_assignments: dict[str, str]
@@ -259,12 +263,88 @@ def load_starsolo_cb_map(path: Path, whitelist: set[str]) -> StarsoloCBMap:
             )
     return StarsoloCBMap(
         bam=path,
+        source_kind="bam_read_name_fallback",
+        rg_filter=None,
         assignments=assignments,
         conflicts=conflicts,
         conflict_read_assignments=conflict_read_assignments,
         conflict_read_assignment_conflicts=conflict_read_assignment_conflicts,
         alignments_seen=alignments_seen,
         tagged_alignments=tagged_alignments,
+    )
+
+
+def load_profiler_cb_bridge(
+    path: Path,
+    whitelist: set[str],
+    rg_filter: str | None = None,
+) -> StarsoloCBMap:
+    """Load the compact profiler bridge without reopening the BAM.
+
+    When an RG is supplied, the bridge is exact for that source FASTQ and a
+    conflict in another RG does not make this source ambiguous. Without an RG
+    filter, a raw barcode carrying ``global_conflict=1`` is deliberately
+    unresolved. With an exact RG filter, only ``within_rg_conflict`` applies;
+    the cross-RG status is audit information. The profiler emits no QNAME table.
+    """
+    if not path.is_file():
+        raise AggregatorError(f"barcode-correction bridge does not exist: {path}")
+    assignments: dict[str, str] = {}
+    conflicts: set[str] = set()
+    reads_seen = 0
+    with open_text(path, "rt") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        required = {
+            "RG", "CR", "CB", "read_count", "within_rg_conflict",
+            "cross_rg_conflict", "global_conflict",
+        }
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise AggregatorError(
+                f"barcode-correction bridge lacks {', '.join(sorted(missing))}: {path}"
+            )
+        for line_number, row in enumerate(reader, start=2):
+            if rg_filter is not None and row["RG"] != rg_filter:
+                continue
+            raw = normalize_barcode(row["CR"])
+            corrected = normalize_barcode(row["CB"])
+            if not raw or not corrected:
+                raise AggregatorError(f"blank CR/CB in bridge {path} line {line_number}")
+            if corrected not in whitelist:
+                raise AggregatorError(
+                    f"profiler CB is absent from the configured whitelist: {corrected}"
+                )
+            try:
+                count = int(row["read_count"])
+            except ValueError as exc:
+                raise AggregatorError(
+                    f"non-integer read_count in bridge {path} line {line_number}"
+                ) from exc
+            if count < 1:
+                raise AggregatorError(
+                    f"nonpositive read_count in bridge {path} line {line_number}"
+                )
+            reads_seen += count
+            flag_field = "global_conflict" if rg_filter is None else "within_rg_conflict"
+            flagged = row[flag_field].strip().lower() in {"1", "true", "yes"}
+            existing = assignments.get(raw)
+            if flagged or (existing is not None and existing != corrected):
+                assignments.pop(raw, None)
+                conflicts.add(raw)
+            elif raw not in conflicts:
+                assignments[raw] = corrected
+    if rg_filter is None and not assignments and not conflicts:
+        raise AggregatorError(f"barcode-correction bridge has no assignments: {path}")
+    return StarsoloCBMap(
+        bam=path,
+        source_kind="profiler_aggregate_bridge",
+        rg_filter=rg_filter,
+        assignments=assignments,
+        conflicts=conflicts,
+        conflict_read_assignments={},
+        conflict_read_assignment_conflicts=set(),
+        alignments_seen=reads_seen,
+        tagged_alignments=reads_seen,
     )
 
 
@@ -830,13 +910,16 @@ def process_library(
     )
     barcode_cache: dict[Path, set[str]] = {}
     starsolo_cache: dict[Path, StarsoloCBMap] = {}
+    bridge_cache: dict[tuple[Path, str], StarsoloCBMap] = {}
     stats: dict[tuple[str, str, str], BarcodeStats] = defaultdict(BarcodeStats)
     annotations: dict[tuple[str, str, str], BarcodeAnnotation] = {}
     qc: Counter[str] = Counter()
     source_qc: list[dict[str, object]] = []
     has_filtered_annotations = any(row["filtered_barcodes"] for row in rows)
     has_raw_annotations = any(row["raw_barcodes"] for row in rows)
-    has_starsolo_cb_assignments = any(row["bam"] for row in rows)
+    has_starsolo_cb_assignments = any(
+        row["barcode_correction_bridge"] or row["bam"] for row in rows
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     source_summary_path = output_dir / f"{library}_trim_by_barcode_by_source.tsv.gz"
@@ -877,6 +960,11 @@ def process_library(
             info_file = Path(row["info_file"])
             tso_file = Path(row["tso_info_file"]) if row["tso_info_file"] else None
             bam = Path(row["bam"]) if row["bam"] else None
+            bridge = (
+                Path(row["barcode_correction_bridge"])
+                if row["barcode_correction_bridge"]
+                else None
+            )
             source_fastq = row["source_fastq"] or row["barcode_fastq"]
             source_id = row["source_id"] or f"{row['run_id']}:{Path(source_fastq).name}"
             for path in (barcode_fastq, info_file):
@@ -885,7 +973,15 @@ def process_library(
             if tso_file is not None and not tso_file.is_file():
                 raise AggregatorError(f"required PE150 TSO audit does not exist: {tso_file}")
             starsolo_map: StarsoloCBMap | None = None
-            if bam is not None:
+            if bridge is not None:
+                resolved_bridge = bridge.resolve()
+                bridge_key = (resolved_bridge, source_id)
+                if bridge_key not in bridge_cache:
+                    bridge_cache[bridge_key] = load_profiler_cb_bridge(
+                        resolved_bridge, whitelist, rg_filter=source_id
+                    )
+                starsolo_map = bridge_cache[bridge_key]
+            elif bam is not None:
                 resolved_bam = bam.resolve()
                 if resolved_bam not in starsolo_cache:
                     starsolo_cache[resolved_bam] = load_starsolo_cb_map(
@@ -1045,6 +1141,12 @@ def process_library(
                     "source_fastq": source_fastq,
                     "barcode_fastq": row["barcode_fastq"],
                     "starsolo_bam": str(bam) if bam is not None else None,
+                    "barcode_correction_bridge": (
+                        str(bridge) if bridge is not None else None
+                    ),
+                    "barcode_correction_source": (
+                        starsolo_map.source_kind if starsolo_map is not None else None
+                    ),
                     "counters": dict(sorted(local_qc.items())),
                     "output_barcodes": len(local_stats),
                 }
@@ -1135,15 +1237,19 @@ def process_library(
             "Hamming-1 fallback; not restricted to STARsolo filtered cells"
         ),
         "barcode_assignment": (
-            "STARsolo BAM CR-to-CB correction is authoritative when observed; conflicting "
-            "CR decisions are resolved by exact BAM read name; raw barcodes absent from "
-            "the mapped-read BAM use exact or unique Hamming-1 fallback; unresolved, "
+            "The profiler aggregate CR-to-CB bridge is preferred and avoids reopening BAM; "
+            "the exact manifest RG resolves cross-source differences, while conflicts "
+            "within an RG remain unresolved and are reported. For runs without a bridge, "
+            "the historical BAM/read-name resolver remains available. Raw barcodes "
+            "absent from evidence use exact or unique Hamming-1 fallback; unresolved, "
             "ambiguous, and uncorrectable reads are counted but not assigned"
         ),
         "starsolo_cb_assignment_available": has_starsolo_cb_assignments,
         "starsolo_cb_maps": [
             {
-                "bam": str(item.bam),
+                "source": str(item.bam),
+                "source_kind": item.source_kind,
+                "rg_filter": item.rg_filter,
                 "raw_barcodes_assigned": len(item.assignments),
                 "raw_barcodes_conflicting": len(item.conflicts),
                 "conflict_read_assignments": len(item.conflict_read_assignments),
@@ -1153,8 +1259,18 @@ def process_library(
                 "alignments_seen": item.alignments_seen,
                 "tagged_alignments": item.tagged_alignments,
             }
-            for item in sorted(starsolo_cache.values(), key=lambda value: str(value.bam))
+            for item in sorted(
+                [*bridge_cache.values(), *starsolo_cache.values()],
+                key=lambda value: (
+                    value.source_kind,
+                    str(value.bam),
+                    value.rg_filter or "",
+                ),
+            )
         ],
+        "profiler_bridge_preferred_over_bam": True,
+        "profiler_bridge_conflicts_are_resolved_only_when_unique_within_rg": True,
+        "profiler_bridge_global_conflicts_without_rg_are_unresolved": True,
         "starsolo_filtered_cells_are_annotation_only": True,
         "unfiltered_is_not_empty_drop": True,
         "empty_drop_roster": (

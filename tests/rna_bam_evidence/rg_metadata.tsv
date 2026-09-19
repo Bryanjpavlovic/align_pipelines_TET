@@ -1,0 +1,4 @@
+fnbase	library	bp_id	sample_idx	lane	flowcell	lane_num	pu	rg_id	rg_string	raw_r1	raw_r2
+fixture1	FixtureRNA	BP1	S1	L001	FLOW	1	FLOW.1	RG1	ID:RG1	/fixture/BP1_R1.fastq.gz	/fixture/BP1_R2.fastq.gz
+fixture2	FixtureRNA	BP2	S1	L001	FLOW	1	FLOW.1	RG2	ID:RG2	/fixture/BP2_R1.fastq.gz	/fixture/BP2_R2.fastq.gz
+fixture3	FixtureRNA	BP2	S1	L002	FLOW	2	FLOW.2	RG3	ID:RG3	/fixture/BP2_L002_R1.fastq.gz	/fixture/BP2_L002_R2.fastq.gz

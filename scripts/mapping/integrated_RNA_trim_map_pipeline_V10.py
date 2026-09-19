@@ -8,6 +8,7 @@ V10 completes the pieces that were split across the historical V9 branches:
 * PE150 R1 handling that preserves CB16+UMI12, removes the internal 13 bp TSO,
   trims the retained R1 cDNA, and maps both cDNA mates;
 * legitimate single-end R2 cutadapt info files for barcode-linked trimming QC;
+* calibrated per-library SLURM memory from compressed trimmed FASTQ volume;
 * direct use of the custom ``align_pipelines/bjp`` module; a mismatch between
   the requested and installed workflow is reported but does not block a run.
 
@@ -32,7 +33,7 @@ from statistics import median
 from typing import Iterable, Sequence
 
 
-RELEASE = "2026-08-30-v18-historical-tso-parity"
+RELEASE = "2026-09-01-v19-calibrated-rna-memory"
 ALIGN_PIPELINES_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RNA_WORKFLOW = str(ALIGN_PIPELINES_ROOT / "workflows" / "align_rna.nf")
 DEFAULT_RNA3_LIB_PREFIX = "Tet_2025_Multiome-RNA_"
@@ -808,11 +809,9 @@ process {{
     clusterOptions = '--exclude=squirtle'
     beforeScript = 'module purge && module load miniforge/3 nextflow/latest align_pipelines/bjp && module load htslib/1.20 samtools/1.20 star/2.7.11b && command -v STAR >/dev/null && command -v samtools >/dev/null'
     cpus = 4
-    memory = '32 GB'
     time = '168 h'
     withName: 'map_rna' {{
         cpus = {threads}
-        memory = '{memgb} GB'
         time = '168 h'
     }}
 }}
@@ -877,7 +876,16 @@ def build_parser() -> argparse.ArgumentParser:
             f"{DEFAULT_RNA5_LIB_PREFIX!r} for 5prime."
         ),
     )
-    parser.add_argument("--memgb", default="80")
+    parser.add_argument(
+        "--memgb",
+        type=int,
+        default=80,
+        help=(
+            "Minimum RNA mapping allocation in GiB and historical STAR BAM-sort "
+            "limit basis; per-library SLURM memory may be raised automatically "
+            "from trimmed FASTQ volume"
+        ),
+    )
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument(
         "--max-cores",
@@ -913,6 +921,10 @@ def normal_main(args: argparse.Namespace) -> int:
     missing = [name for name, value in required.items() if not value]
     if missing:
         raise PipelineError("missing required argument(s): " + ", ".join(missing))
+    if args.memgb < 2:
+        raise PipelineError("--memgb must be at least 2 GiB")
+    if args.threads < 1:
+        raise PipelineError("--threads must be a positive integer")
     if not 0 <= args.min_pe150_tso_match_fraction <= 1:
         raise PipelineError("--min-pe150-tso-match-fraction must be between 0 and 1")
     if args.max_cores is not None:

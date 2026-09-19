@@ -11,14 +11,15 @@ deliberately narrow:
 * generate all child scripts below one run-specific staging directory;
 * submit the SLURM dependency graph only when ``--submit`` is present;
 * collect trimming, RNA mapping, and ATAC QC plots;
-* validate expected files without publishing over production data.
+* validate durable outputs without publishing over production data;
+* mark Nextflow work caches as manually removable, but never delete them.
 
 Dry-run script generation is the default.  The same command with ``--submit``
 launches the jobs.  Use ``--resume`` only to continue the same immutable run.
 
 Repository and package layout
 -----------------------------
-Keep this file and the seven runtime helpers listed below together in
+Keep this file and the runtime helpers listed below together in
 ``scripts/mapping`` in the align_pipelines repository. Install that directory
 into ``bin/mapping`` below the deployed align_pipelines package. The
 orchestrator resolves helpers beside its own path and workflows from the
@@ -31,6 +32,13 @@ repository/package root, so no resource override is needed in either layout.
 * plot_mapping_stats_V5.py
 * collect_atac_qc.py
 * plot_atac_qc_v2.py
+* run_rna_bam_evidence.py
+* rna_evidence_common.py
+* analyze_gained_cells.py
+* analyze_depth_history.py
+* join_trim_cell_metrics.py
+* export_repooling_evidence.py
+* plot_rna_evidence.py
 
 The Nextflow workflows are owned by the same repository and remain below its
 top-level ``workflows`` directory.
@@ -75,6 +83,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import gzip
 import hashlib
 import importlib.util
@@ -92,12 +101,12 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-RELEASE = "2026-08-30-v14-align-repo-migration"
+RELEASE = "2026-09-15-v25-central-figures-flexible-run-dir"
 
 DEFAULT_RNA3_RAW_ROOT = "/mnt/beegfs/reads/3P_Multiome_10XRNA"
 DEFAULT_ATAC_RAW_ROOT = "/mnt/beegfs/reads/10X_ATAC_multiome"
 DEFAULT_RNA5_RAW_ROOT = "/mnt/beegfs/reads/5P_10XRNA"
-DEFAULT_STAGING_ROOT = "/mnt/beegfs/tet2025_mapping_staging"
+DEFAULT_STAGING_ROOT = "/mnt/beegfs/tetraploid_multiome_cis_trans"
 DEFAULT_RNA3_LIB_PREFIX = "Tet_2025_Multiome-RNA_"
 DEFAULT_RNA5_LIB_PREFIX = "Tet_2025_RNA_5P_"
 DEFAULT_ATAC_LIB_PREFIX = "Tet_2025_Multiome-ATAC_"
@@ -120,12 +129,50 @@ DEFAULT_WHITELIST_ROOT = (
 DEFAULT_RNA3_WHITELIST = f"{DEFAULT_WHITELIST_ROOT}/RNA-737K-arc-v1.txt.gz"
 DEFAULT_RNA5_WHITELIST = DEFAULT_RNA3_WHITELIST
 DEFAULT_ATAC_WHITELIST = f"{DEFAULT_WHITELIST_ROOT}/ATAC-737K-arc-v1.txt.gz"
-DEFAULT_PRODUCTION_RNA = "/mnt/beegfs/tetmultiome_rna_mapped/mapping_output"
-DEFAULT_PRODUCTION_ATAC = "/mnt/beegfs/tetmultiome_atac/mapping_output"
+DEFAULT_PRODUCTION_RNA = (
+    "/mnt/beegfs/tetraploid_multiome_cis_trans/3P/mapping_output"
+)
+DEFAULT_PRODUCTION_ATAC = (
+    "/mnt/beegfs/tetraploid_multiome_cis_trans/ATAC/mapping_output"
+)
+DEFAULT_RNA3_FIGURE_BASE = (
+    "/mnt/beegfs/tetraploid_multiome_cis_trans/3P/figures"
+)
+DEFAULT_RNA5_FIGURE_BASE = (
+    "/mnt/beegfs/tetraploid_multiome_cis_trans/5P/figures"
+)
+DEFAULT_ATAC_FIGURE_BASE = (
+    "/mnt/beegfs/tetraploid_multiome_cis_trans/ATAC/figures"
+)
 
 ALL_STAGES = ("trim", "map", "qc", "plot", "validate")
-
-
+DEFAULT_BAM_EVIDENCE_HASH_SEED = 1469598103934665603
+RNA_BAM_EVIDENCE_STARSOLO_FEATURE = "GeneFull_Ex50pAS"
+RNA_BAM_EVIDENCE_STARSOLO_UMI_FILTERING = "MultiGeneUMI_CR"
+RNA_BAM_EVIDENCE_STARSOLO_UMI_DEDUP = "1MM_CR"
+RNA_BAM_EVIDENCE_STARSOLO_MULTIMAPPERS = "EM"
+RNA_BAM_EVIDENCE_HASH_ALGORITHM = "fnv1a64_seeded_v1"
+RNA_BAM_EVIDENCE_ORDINARY_COUNTEDU_READ_DEFINITION = (
+    "distinct_RG_QNAME_declared_RG_valid_CB_singleton_feature_GX_"
+    "NH_unrestricted_UB_not_required_STARsolo_pre_UMI_filter_countedU"
+)
+RNA_BAM_EVIDENCE_ORDINARY_MOLECULE_DEFINITION = (
+    "distinct_CB_GX_valid_STARsolo_corrected_UB_after_1MM_CR_and_"
+    "MultiGeneUMI_CR_NH_unrestricted"
+)
+RNA_BAM_EVIDENCE_MULTIMAPPER_DEFINITION = (
+    "STARsolo_multi_gene_EM_unavailable_from_standard_uppercase_GX_UB_"
+    "BAM_tags_NH_is_not_EM_membership"
+)
+RNA_BAM_EVIDENCE_SUMMARY_UNIQUE_READ_METRIC = (
+    "Unique Reads in Cells Mapped to GeneFull_Ex50pAS"
+)
+RNA_BAM_EVIDENCE_NH_GT1_UNIQUE_GENE_DEFINITION = (
+    "subset_of_ordinary_countedU_reads_with_NH_gt1_and_singleton_feature_GX"
+)
+RNA_BAM_EVIDENCE_EM_AVAILABILITY = (
+    "unavailable_from_standard_uppercase_GX_UB_BAM_tags"
+)
 class OrchestratorError(RuntimeError):
     """A user-facing orchestration error."""
 
@@ -141,6 +188,9 @@ class Resources:
     mapping_plotter: Path | None
     atac_collector: Path | None
     atac_plotter: Path | None
+    bam_evidence_runner: Path | None
+    bam_evidence_profiler: Path | None
+    star_diagnostic_promoter: Path | None
 
 
 @dataclass
@@ -189,6 +239,22 @@ def atomic_text(path: Path, text: str, mode: int | None = None) -> None:
 
 def atomic_json(path: Path, payload: object) -> None:
     atomic_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def acquire_run_lock(run_dir: Path):
+    """Hold one prepare/generate/submit transaction per staged run."""
+    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = run_dir.parent / f".{run_dir.name}.orchestrator.lock"
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise OrchestratorError(
+            f"another orchestrator process is active for {run_dir}; no jobs "
+            "were generated or submitted"
+        ) from exc
+    return handle
 
 
 def file_sha256(path: Path) -> str:
@@ -279,6 +345,20 @@ def find_resource(
     return None
 
 
+def find_bam_evidence_profiler(explicit: str | None) -> Path | None:
+    """Resolve the compiled profiler without depending on a module-mutated PATH."""
+    if explicit:
+        return Path(explicit).expanduser().resolve(strict=False)
+    candidates = (
+        MAPPING_SCRIPT_DIR.parent / "rna_bam_evidence",
+        ALIGN_PIPELINES_ROOT / "rna_bam_evidence",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
 def resolve_resources(args: argparse.Namespace) -> Resources:
     root = Path(args.resource_root).expanduser().resolve(strict=False)
     return Resources(
@@ -346,6 +426,21 @@ def resolve_resources(args: argparse.Namespace) -> Resources:
             root,
             ("plot_atac_qc_v2.py", "ATAC_QC/plot_atac_qc_v2.py"),
             ("plot_atac_qc_v2.py",),
+        ),
+        bam_evidence_runner=find_resource(
+            args.rna3_bam_evidence_runner,
+            root,
+            ("run_rna_bam_evidence.py",),
+            ("run_rna_bam_evidence.py",),
+        ),
+        bam_evidence_profiler=find_bam_evidence_profiler(
+            args.rna3_bam_evidence_profiler
+        ),
+        star_diagnostic_promoter=find_resource(
+            args.rna3_star_diagnostic_promoter,
+            root,
+            ("promote_rna_star_diagnostics.py",),
+            ("promote_rna_star_diagnostics.py",),
         ),
     )
 
@@ -578,6 +673,23 @@ def resource_failures(
         if inputs.rna3 or inputs.rna5:
             require_file("trimming plotter", resources.trim_plotter)
             require_file("mapping plotter", resources.mapping_plotter)
+        if args.rna3_mapping_baseline_stats:
+            require_path(
+                "3' RNA mapping baseline statistics",
+                args.rna3_mapping_baseline_stats,
+            )
+        if args.rna3_mapping_baseline_root:
+            require_path(
+                "3' RNA mapping baseline root",
+                args.rna3_mapping_baseline_root,
+                directory=True,
+            )
+        if args.rna3_mapping_baseline_work_root:
+            require_path(
+                "3' RNA mapping baseline Nextflow work root",
+                args.rna3_mapping_baseline_work_root,
+                directory=True,
+            )
         if inputs.atac:
             require_file("ATAC plotter", resources.atac_plotter)
     if inputs.atac and "qc" in stages:
@@ -590,6 +702,33 @@ def resource_failures(
             failures.append(
                 "RNA barcode-linked trimming QC requires both trim and map stages "
                 "(or use --no-trim-info to skip that QC product)"
+            )
+
+    if inputs.rna3 and args.rna3_bam_evidence_from_bam:
+        require_file("RNA BAM evidence runner", resources.bam_evidence_runner)
+        require_file("compiled RNA BAM evidence profiler", resources.bam_evidence_profiler)
+        if (
+            resources.bam_evidence_profiler is not None
+            and resources.bam_evidence_profiler.is_file()
+            and not os.access(resources.bam_evidence_profiler, os.X_OK)
+        ):
+            failures.append(
+                "compiled RNA BAM evidence profiler is not executable: "
+                f"{resources.bam_evidence_profiler}"
+            )
+        require_file(
+            "RNA STAR diagnostic promoter", resources.star_diagnostic_promoter
+        )
+        if args.rna3_bam_evidence_baseline_root:
+            require_path(
+                "RNA BAM evidence baseline root",
+                args.rna3_bam_evidence_baseline_root,
+                directory=True,
+            )
+        if args.rna3_bam_evidence_class_manifest:
+            require_path(
+                "RNA BAM evidence classification manifest",
+                args.rna3_bam_evidence_class_manifest,
             )
 
     if args.submit and shutil.which("sbatch") is None:
@@ -673,6 +812,7 @@ def config_payload(
     return {
         "release": RELEASE,
         "run_name": args.run_name,
+        "run_dir": args.run_dir,
         "inputs": {
             "rna3": [str(path) for path in inputs.rna3],
             "atac": [str(path) for path in inputs.atac],
@@ -736,6 +876,47 @@ def config_payload(
             if args.nodelist is not None or args.array_max_concurrent is not None
             else None
         ),
+        "reporting": {
+            "rna3_figure_root": args.rna3_figure_root,
+            "rna5_figure_root": args.rna5_figure_root,
+            "atac_figure_root": args.atac_figure_root,
+            "rna3_mapping_baseline_stats": (
+                {
+                    "path": str(
+                        Path(args.rna3_mapping_baseline_stats).resolve(strict=False)
+                    ),
+                    "sha256": file_sha256(Path(args.rna3_mapping_baseline_stats)),
+                }
+                if args.rna3_mapping_baseline_stats
+                else None
+            ),
+            "rna3_mapping_baseline_label": args.rna3_mapping_baseline_label,
+            "rna3_mapping_current_label": args.rna3_mapping_current_label,
+            "rna3_mapping_baseline_root": args.rna3_mapping_baseline_root,
+            "rna3_mapping_baseline_work_root": args.rna3_mapping_baseline_work_root,
+            "rna3_bam_evidence_from_bam": args.rna3_bam_evidence_from_bam,
+            "rna3_bam_evidence_cpus": args.rna3_bam_evidence_cpus,
+            "rna3_bam_evidence_memory_gb": args.rna3_bam_evidence_memory_gb,
+            "rna3_bam_evidence_max_concurrent": (
+                args.rna3_bam_evidence_max_concurrent
+            ),
+            "rna3_bam_evidence_baseline_root": (
+                args.rna3_bam_evidence_baseline_root
+            ),
+            "rna3_bam_evidence_source_order": (
+                args.rna3_bam_evidence_source_order
+            ),
+            "rna3_bam_evidence_hash_bins": args.rna3_bam_evidence_hash_bins,
+            "rna3_bam_evidence_class_manifest": (
+                args.rna3_bam_evidence_class_manifest
+            ),
+            "rna3_bam_evidence_no_biological_classification": (
+                args.rna3_bam_evidence_no_biological_classification
+            ),
+            "rna3_bam_evidence_reset_failed_run": (
+                args.rna3_bam_evidence_reset_failed_run
+            ),
+        },
     }
 
 
@@ -745,11 +926,11 @@ def payload_hash(payload: dict[str, object]) -> str:
 
 
 def scientific_config(payload: dict[str, object]) -> dict[str, object]:
-    """Return the immutable data/reference/analysis portion of a run config."""
+    """Return immutable mapping inputs; BAM evidence has its own frozen config."""
     return {
         key: value
         for key, value in payload.items()
-        if key not in {"release", "resources", "scheduling"}
+        if key not in {"release", "resources", "scheduling", "reporting"}
     }
 
 
@@ -759,6 +940,7 @@ def runtime_config(payload: dict[str, object]) -> dict[str, object]:
         "release": payload.get("release"),
         "resources": payload.get("resources"),
         "scheduling": payload.get("scheduling"),
+        "reporting": payload.get("reporting"),
     }
 
 
@@ -1311,6 +1493,7 @@ def generate_barcode_trim_jobs(
     run_dir: Path,
     resources: Resources,
     dependencies: Sequence[str],
+    use_evidence_bridge: bool = False,
 ) -> list[JobSpec]:
     """Generate full-population trim joins plus labelled derived views."""
     assert resources.barcode_aggregator is not None
@@ -1354,6 +1537,13 @@ def generate_barcode_trim_jobs(
                 raw = root / "mapping_output" / library / "raw" / "barcodes.tsv.gz"
                 filtered = root / "mapping_output" / library / "filtered" / "barcodes.tsv.gz"
                 bam = root / "mapping_output" / library / "gex.bam"
+                bridge = (
+                    root
+                    / "mapping_output"
+                    / library
+                    / "bam_evidence"
+                    / "raw_to_corrected_barcode_counts.tsv.gz"
+                )
                 rows.append(
                     "\t".join(
                         [
@@ -1368,8 +1558,9 @@ def generate_barcode_trim_jobs(
                             "",
                             str(raw),
                             str(filtered),
-                            str(bam),
+                            "" if use_evidence_bridge else str(bam),
                             str(rg_metadata),
+                            str(bridge) if use_evidence_bridge else "",
                         ]
                     )
                     + "\n"
@@ -1389,8 +1580,9 @@ def generate_barcode_trim_jobs(
                                 str(log_dir / f"{sample}_R1_tso_info.tsv.gz"),
                                 str(raw),
                                 str(filtered),
-                                str(bam),
+                                "" if use_evidence_bridge else str(bam),
                                 str(rg_metadata),
+                                str(bridge) if use_evidence_bridge else "",
                             ]
                         )
                         + "\n"
@@ -1401,7 +1593,7 @@ def generate_barcode_trim_jobs(
         manifest,
         "library\trun_id\tsource_id\tread_format\tmate\tbarcode_fastq\t"
         "source_fastq\tinfo_file\ttso_info_file\traw_barcodes\tfiltered_barcodes\t"
-        "bam\trg_metadata\n"
+        "bam\trg_metadata\tbarcode_correction_bridge\n"
         + "".join(rows),
     )
     library_file = control / f"{modality}_trim_barcode_libraries.txt"
@@ -1532,13 +1724,14 @@ def generate_trim_plot_job(
     modality: str,
     root: Path,
     run_dir: Path,
+    figure_root: Path,
     resources: Resources,
     dependencies: Sequence[str],
 ) -> JobSpec:
     assert resources.trim_plotter is not None
     script = run_dir / "control" / "slurm" / f"plot_{modality}_trimming.sbatch"
-    work = run_dir / "qc" / modality / "trimming"
-    report_dir = work / "json_reports"
+    work = figure_root / "trimming"
+    report_dir = run_dir / "qc" / modality / "trimming" / "json_reports"
     marker = work / "TRIMMING_PLOTS_COMPLETE.ok"
     body = f"""if [[ -s {q(marker)} ]]; then
     echo "SKIP: {modality} trimming plots already completed"
@@ -1577,14 +1770,58 @@ def generate_mapping_plot_job(
     modality: str,
     root: Path,
     run_dir: Path,
+    figure_root: Path,
     resources: Resources,
     dependencies: Sequence[str],
+    baseline_stats: str | None = None,
+    baseline_label: str = "Baseline",
+    current_label: str = "Current",
+    baseline_base_path: str | None = None,
+    baseline_cell_reads_work_root: str | None = None,
 ) -> JobSpec:
     assert resources.mapping_plotter is not None
     script = run_dir / "control" / "slurm" / f"plot_{modality}_mapping.sbatch"
-    out = run_dir / "qc" / modality / "mapping"
+    out = figure_root / "mapping_QC"
     marker = out / "MAPPING_PLOTS_COMPLETE.ok"
-    body = f"""if [[ -s {q(marker)} ]]; then
+    expected_outputs = [
+        out / "processedstats.tsv",
+        out / "quality_control_dashboard.png",
+        out / "cell_quality_matrix.png",
+        out / "outlier_detection_report.png",
+        out / "reads_per_cell.tsv.gz",
+        out / "reads_per_cell_distribution.png",
+    ]
+    comparison_args = ""
+    if baseline_stats:
+        expected_outputs.extend(
+            [
+                out / "mapping_stats_deltas.tsv",
+                out / "mapping_delta_dashboard.png",
+            ]
+        )
+        comparison_args = (
+            f" \\\n    --baseline-stats {q(baseline_stats)}"
+        )
+    cell_read_args = (
+        f" \\\n    --cell-read-distribution"
+        f" \\\n    --cell-reads-work-root {q(root / 'mapping_project' / 'work')}"
+        f" \\\n    --baseline-label {q(baseline_label)}"
+        f" \\\n    --current-label {q(current_label)}"
+    )
+    if baseline_base_path:
+        cell_read_args += f" \\\n    --baseline-base-path {q(baseline_base_path)}"
+    if baseline_cell_reads_work_root:
+        cell_read_args += (
+            f" \\\n    --baseline-cell-reads-work-root {q(baseline_cell_reads_work_root)}"
+        )
+    output_checks = "\n".join(
+        f"test -s {q(path)} || {{ echo {q('ERROR: missing mapping plot output: ' + str(path))} >&2; exit 1; }}"
+        for path in expected_outputs
+    )
+    completion_condition = " && ".join(
+        [f"[[ -s {q(marker)} ]]", *[f"[[ -s {q(path)} ]]" for path in expected_outputs]]
+    )
+    body = f"""if {completion_condition}; then
     echo "SKIP: {modality} mapping plots already completed"
     exit 0
 fi
@@ -1595,7 +1832,8 @@ mkdir -p {q(out)}
 python3 {q(resources.mapping_plotter)} \\
     --base-path {q(root / 'mapping_output')} \\
     --output-dir {q(out)} \\
-    --plot-type all
+    --plot-type all{comparison_args}{cell_read_args}
+{output_checks}
 date -Is > {q(marker)}
 """
     write_sbatch(
@@ -1614,6 +1852,649 @@ date -Is > {q(marker)}
         script=script,
         dependencies=list(dependencies),
     )
+
+
+def _existing_optional_product(directory: Path, relative: str) -> str:
+    """Resolve an optional plain/gzip baseline product without guessing content."""
+    candidate = directory / relative
+    alternatives = [candidate]
+    if candidate.suffix == ".gz":
+        alternatives.append(candidate.with_suffix(""))
+    else:
+        alternatives.append(candidate.with_name(candidate.name + ".gz"))
+    return str(next((path.resolve() for path in alternatives if path.is_file()), ""))
+
+
+def _scientific_text_snapshot(path: Path, label: str) -> dict[str, object]:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise OrchestratorError(f"{label} is missing or empty: {path}")
+    raw = path.read_bytes()
+    try:
+        contents = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise OrchestratorError(f"{label} is not UTF-8 text: {path}") from exc
+    return {
+        "path": str(path.resolve()),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "contents": contents,
+    }
+
+
+def _frozen_bam_evidence_config(
+    manifest_fields: Sequence[str],
+    rows: Sequence[dict[str, object]],
+    source_order_path: Path,
+    source_order_text: str,
+    source_order_provenance: str,
+    source_values: Sequence[str],
+    baseline_root: Path | None,
+    class_manifest: str,
+    hash_bins: int,
+    profiler: Path,
+) -> dict[str, object]:
+    source_bytes = source_order_text.encode("utf-8")
+    classification: dict[str, object]
+    if class_manifest:
+        classification = {
+            "status": "manifest",
+            **_scientific_text_snapshot(
+                Path(class_manifest), "RNA BAM evidence class manifest"
+            ),
+        }
+    else:
+        classification = {
+            "status": "explicit_unavailable",
+            "path": "",
+            "sha256": "",
+            "contents": "",
+        }
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "immutability": "created_by_first_run_and_required_unchanged_on_resume",
+        "selected_libraries": [str(row["library"]) for row in rows],
+        "manifest_fields": list(manifest_fields),
+        "manifest_rows": [
+            {field: str(row[field]) for field in manifest_fields}
+            for row in rows
+        ],
+        "resolved_current_inputs": {
+            str(row["library"]): {
+                field: str(row[field])
+                for field in (
+                    "library_dir", "bam", "bam_index", "summary",
+                    "raw_barcodes", "filtered_barcodes", "raw_features",
+                    "raw_matrix", "filtered_matrix", "rg_metadata",
+                    "native_cell_reads",
+                )
+            }
+            for row in rows
+        },
+        "baseline": {
+            "root": str(baseline_root) if baseline_root else "",
+            "resolved_inputs": {
+                str(row["library"]): {
+                    "old_raw_barcodes": str(row["old_raw_barcodes"]),
+                    "old_filtered_barcodes": str(row["old_filtered_barcodes"]),
+                }
+                for row in rows
+            },
+        },
+        "source_order": {
+            "path": str(source_order_path.resolve()),
+            "provenance": source_order_provenance,
+            "values": list(source_values),
+            "sha256": hashlib.sha256(source_bytes).hexdigest(),
+            "contents": source_order_text,
+        },
+        "biological_classification": classification,
+        "hash": {
+            "algorithm": RNA_BAM_EVIDENCE_HASH_ALGORITHM,
+            "seed": DEFAULT_BAM_EVIDENCE_HASH_SEED,
+            "bins": hash_bins,
+        },
+        "profiler_executable": {
+            "path": str(profiler.resolve()),
+            "sha256": file_sha256(profiler),
+            "bytes": profiler.stat().st_size,
+        },
+        "starsolo": {
+            "feature": RNA_BAM_EVIDENCE_STARSOLO_FEATURE,
+            "umi_filtering": RNA_BAM_EVIDENCE_STARSOLO_UMI_FILTERING,
+            "umi_dedup": RNA_BAM_EVIDENCE_STARSOLO_UMI_DEDUP,
+            "multimappers": RNA_BAM_EVIDENCE_STARSOLO_MULTIMAPPERS,
+            "ordinary_countedU_read_definition": (
+                RNA_BAM_EVIDENCE_ORDINARY_COUNTEDU_READ_DEFINITION
+            ),
+            "ordinary_molecule_definition": (
+                RNA_BAM_EVIDENCE_ORDINARY_MOLECULE_DEFINITION
+            ),
+            "multimapper_definition": RNA_BAM_EVIDENCE_MULTIMAPPER_DEFINITION,
+            "summary_unique_read_metric": (
+                RNA_BAM_EVIDENCE_SUMMARY_UNIQUE_READ_METRIC
+            ),
+            "nh_gt1_unique_gene_countedU_definition": (
+                RNA_BAM_EVIDENCE_NH_GT1_UNIQUE_GENE_DEFINITION
+            ),
+            "starsolo_EM_evidence_availability": (
+                RNA_BAM_EVIDENCE_EM_AVAILABILITY
+            ),
+        },
+    }
+    payload["configuration_hash"] = payload_hash(payload)
+    return payload
+
+
+def _validate_or_create_bam_evidence_config(
+    path: Path,
+    expected: dict[str, object],
+) -> None:
+    if path.is_file():
+        try:
+            stored = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise OrchestratorError(
+                f"could not read frozen RNA BAM evidence configuration: {path}"
+            ) from exc
+        if stored != expected:
+            raise OrchestratorError(
+                "RNA BAM evidence scientific configuration differs from the "
+                "frozen configuration; no BAM-reader job was generated"
+            )
+        return
+    atomic_json(path, expected)
+
+
+def _validate_or_create_frozen_text(
+    path: Path,
+    expected: str,
+    label: str,
+) -> None:
+    if path.is_file():
+        try:
+            actual = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise OrchestratorError(f"could not read frozen {label}: {path}") from exc
+        if actual != expected:
+            raise OrchestratorError(
+                f"{label} differs from its frozen copy; no BAM-reader job was generated"
+            )
+        return
+    atomic_text(path, expected)
+
+
+def _reset_failed_bam_evidence_run(
+    run_dir: Path,
+    rows: Sequence[dict[str, object]],
+    scientific_config_path: Path,
+    frozen_config: dict[str, object],
+    source_order_path: Path,
+    source_order_text: str,
+    manifest: Path,
+    manifest_text: str,
+) -> None:
+    """Archive an obsolete failed evidence run after proving its jobs terminal."""
+    if not scientific_config_path.is_file():
+        raise OrchestratorError(
+            "--rna3-bam-evidence-reset-failed-run requires an existing frozen "
+            "BAM-evidence configuration"
+        )
+
+    plan_path = run_dir / "control" / "job_plan.json"
+    if not plan_path.is_file() or plan_path.stat().st_size == 0:
+        raise OrchestratorError(
+            "refusing failed-run reset because the prior submission ledger "
+            f"is missing or empty: {plan_path}"
+        )
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise OrchestratorError(
+            f"cannot verify prior BAM-reader state from {plan_path}: {exc}"
+        ) from exc
+    if (
+        not isinstance(plan, dict)
+        or not isinstance(plan.get("jobs"), list)
+        or not plan["jobs"]
+        or any(not isinstance(job, dict) for job in plan["jobs"])
+    ):
+        raise OrchestratorError(
+            f"cannot verify prior BAM-reader state from malformed or empty {plan_path}"
+        )
+    for job in plan["jobs"]:
+        label = str(job.get("label", ""))
+        raw_job_id = job.get("job_id")
+        protected = (
+            label.startswith("rna3_bam_evidence")
+            or label == "rna3_star_diagnostics"
+        )
+        if not raw_job_id or not protected:
+            continue
+        job_id = str(raw_job_id)
+        states = slurm_accounting_states(job_id)
+        if not states:
+            raise OrchestratorError(
+                "refusing failed-run reset because SLURM accounting "
+                f"could not prove RNA evidence job {job_id} ({label}) is "
+                "terminal"
+            )
+        active = sorted(set(states).intersection(SLURM_ACTIVE_STATES))
+        if active:
+            raise OrchestratorError(
+                "refusing failed-run reset while prior RNA evidence job "
+                f"{job_id} ({label}) is active: {','.join(active)}"
+            )
+        unknown = sorted(
+            set(states) - SLURM_FAILURE_STATES - {"COMPLETED"}
+        )
+        if unknown:
+            raise OrchestratorError(
+                "refusing failed-run reset because SLURM did not prove "
+                f"RNA evidence job {job_id} ({label}) terminal: "
+                f"{','.join(unknown)}"
+            )
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    old_hash = file_sha256(scientific_config_path)[:16]
+    archive = (
+        run_dir / "control" / "rna3_bam_evidence_failed_run_migrations"
+        / f"{timestamp}_{old_hash}"
+    )
+    archive.mkdir(parents=True, exist_ok=False)
+    for path in (
+        scientific_config_path,
+        source_order_path,
+        manifest,
+        run_dir / "control" / "rna3_bam_evidence_pilot_selection.json",
+        run_dir / "control" / "rna3_bam_evidence_phase.json",
+        run_dir / "control" / "rna3_bam_evidence_execution.json",
+        plan_path,
+    ):
+        if path.is_file():
+            shutil.copy2(path, archive / path.name)
+    archived_scripts = archive / "slurm"
+    old_scripts = list((run_dir / "control" / "slurm").glob(
+        "rna3_bam_evidence*.sbatch"
+    ))
+    diagnostic_script = (
+        run_dir / "control" / "slurm" / "rna3_star_diagnostic_promotion.sbatch"
+    )
+    if diagnostic_script.is_file():
+        old_scripts.append(diagnostic_script)
+    for path in sorted(set(old_scripts)):
+        archived_scripts.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), archived_scripts / path.name)
+
+    archived_evidence = archive / "evidence"
+    for row in rows:
+        output_dir = Path(str(row["output_dir"]))
+        if output_dir.exists():
+            destination = archived_evidence / str(row["library"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(output_dir), destination)
+    gathered = run_dir / "qc" / "rna3" / "bam_evidence"
+    if gathered.exists():
+        shutil.move(str(gathered), archive / "gathered_bam_evidence")
+    atomic_json(
+        archive / "migration.json",
+        {
+            "created_utc": utc_now(),
+            "reason": "explicit_obsolete_failed_run_semantic_reset",
+            "prior_jobs_proven_terminal": True,
+            "prior_evidence_moved_to_archive": True,
+            "replacement_configuration_hash": frozen_config["configuration_hash"],
+        },
+    )
+    if plan_path.is_file():
+        # Preserve unrelated mapping job IDs, but make every BAM-evidence job
+        # new for restore_prior_job_ids(). Reusing the failed array ID
+        # would otherwise abort or, with expired accounting, falsely satisfy a
+        # dependency after this explicit scientific-contract migration.
+        invalidated = {
+            str(job.get("label", ""))
+            for job in plan.get("jobs", [])
+            if (
+                str(job.get("label", "")).startswith("rna3_bam_evidence")
+                or str(job.get("label", "")) == "rna3_star_diagnostics"
+            )
+        }
+        changed = True
+        while changed:
+            changed = False
+            for job in plan.get("jobs", []):
+                label = str(job.get("label", ""))
+                dependencies = {
+                    str(value) for value in job.get("dependencies", [])
+                }
+                if label not in invalidated and dependencies.intersection(invalidated):
+                    invalidated.add(label)
+                    changed = True
+        retained_jobs = [
+            job for job in plan.get("jobs", [])
+            if str(job.get("label", "")) not in invalidated
+        ]
+        replacement_plan = dict(plan)
+        replacement_plan["jobs"] = retained_jobs
+        replacement_plan["bam_evidence_failed_run_reset_utc"] = utc_now()
+        atomic_json(plan_path, replacement_plan)
+    for obsolete in (
+        run_dir / "control" / "rna3_bam_evidence_phase.json",
+        run_dir / "control" / "rna3_bam_evidence_pilot_selection.json",
+        run_dir / "control" / "rna3_bam_evidence_execution.json",
+    ):
+        obsolete.unlink(missing_ok=True)
+    atomic_json(scientific_config_path, frozen_config)
+    atomic_text(source_order_path, source_order_text)
+    atomic_text(manifest, manifest_text)
+
+
+def generate_rna_bam_evidence_jobs(
+    libraries: Sequence[str],
+    root: Path,
+    run_dir: Path,
+    args: argparse.Namespace,
+    resources: Resources,
+    dependencies: Sequence[str],
+    inferred_source_order: Sequence[str],
+) -> list[JobSpec]:
+    """Create one bounded all-library evidence array and BAM-free gather."""
+    if not libraries:
+        raise OrchestratorError("no 3' RNA libraries were selected for BAM evidence")
+    if len(libraries) >= 1000:
+        raise OrchestratorError(
+            "RNA BAM evidence requires fewer than 1000 selected library tasks"
+        )
+    assert resources.bam_evidence_runner is not None
+    assert resources.bam_evidence_profiler is not None
+    assert resources.star_diagnostic_promoter is not None
+    mapping_output = root / "mapping_output"
+    rg_metadata = root / "mapping_project" / "rg_metadata.tsv"
+    source_values = list(
+        args.rna3_bam_evidence_source_order or inferred_source_order
+    )
+    if not source_values or len(source_values) != len(set(source_values)):
+        raise OrchestratorError(
+            "RNA BAM evidence source order must be nonempty and contain no duplicates"
+        )
+    source_order_provenance = (
+        "explicit --rna3-bam-evidence-source-order"
+        if args.rna3_bam_evidence_source_order
+        else "original user-provided --rna3-runs order"
+    )
+    control = run_dir / "control"
+    source_order_path = control / "rna3_bam_evidence_source_order.tsv"
+    source_order_text = "source_id\n" + "".join(
+        f"{value}\n" for value in source_values
+    )
+    scientific_config_path = control / "rna3_bam_evidence_scientific_config.json"
+    baseline_root = (
+        Path(args.rna3_bam_evidence_baseline_root).resolve(strict=False)
+        if args.rna3_bam_evidence_baseline_root
+        else None
+    )
+    class_manifest = (
+        str(Path(args.rna3_bam_evidence_class_manifest).resolve(strict=False))
+        if args.rna3_bam_evidence_class_manifest
+        else ""
+    )
+    rows: list[dict[str, object]] = []
+    for library in libraries:
+        library_dir = (mapping_output / library).resolve(strict=False)
+        bam = library_dir / "gex.bam"
+        baseline_library = baseline_root / library if baseline_root else None
+        native_cell_reads = _existing_optional_product(
+            library_dir, "CellReads.stats.gz"
+        )
+        rows.append(
+            {
+                "library": library,
+                "library_dir": str(library_dir),
+                "bam": str(bam),
+                "bam_index": str(library_dir / "gex.bam.bai"),
+                "summary": str(library_dir / "Summary.csv"),
+                "raw_barcodes": str(library_dir / "raw" / "barcodes.tsv.gz"),
+                "filtered_barcodes": str(
+                    library_dir / "filtered" / "barcodes.tsv.gz"
+                ),
+                "raw_features": str(library_dir / "raw" / "features.tsv.gz"),
+                "raw_matrix": str(library_dir / "raw" / "matrix.mtx.gz"),
+                "filtered_matrix": str(
+                    library_dir / "filtered" / "matrix.mtx.gz"
+                ),
+                "rg_metadata": str(rg_metadata.resolve(strict=False)),
+                "source_order": str(source_order_path.resolve()),
+                "scientific_config": str(scientific_config_path.resolve()),
+                "source_order_provenance": source_order_provenance,
+                "starsolo_feature": RNA_BAM_EVIDENCE_STARSOLO_FEATURE,
+                "starsolo_umi_filtering": (
+                    RNA_BAM_EVIDENCE_STARSOLO_UMI_FILTERING
+                ),
+                "starsolo_umi_dedup": RNA_BAM_EVIDENCE_STARSOLO_UMI_DEDUP,
+                "starsolo_multimappers": (
+                    RNA_BAM_EVIDENCE_STARSOLO_MULTIMAPPERS
+                ),
+                "biological_classification_intent": (
+                    "manifest" if class_manifest else "explicit_unavailable"
+                ),
+                "old_raw_barcodes": (
+                    _existing_optional_product(
+                        baseline_library, "raw/barcodes.tsv.gz"
+                    )
+                    if baseline_library else ""
+                ),
+                "old_filtered_barcodes": (
+                    _existing_optional_product(
+                        baseline_library, "filtered/barcodes.tsv.gz"
+                    )
+                    if baseline_library else ""
+                ),
+                "class_manifest": class_manifest,
+                "native_cell_reads": native_cell_reads,
+                "output_dir": str(library_dir / "bam_evidence"),
+                "bam_bytes": bam.stat().st_size if bam.is_file() else 0,
+            }
+        )
+
+    def library_number_from_name(name: object) -> tuple[int, str]:
+        match = re.search(r"(\d+)$", str(name))
+        return (int(match.group(1)) if match else sys.maxsize, str(name))
+
+    if scientific_config_path.is_file():
+        try:
+            frozen_order = json.loads(
+                scientific_config_path.read_text(encoding="utf-8")
+            ).get("selected_libraries", [])
+        except (OSError, json.JSONDecodeError) as exc:
+            raise OrchestratorError(
+                f"could not read frozen RNA BAM evidence configuration: "
+                f"{scientific_config_path}"
+            ) from exc
+        by_library = {str(row["library"]): row for row in rows}
+        if (
+            not isinstance(frozen_order, list)
+            or len(frozen_order) != len(rows)
+            or set(frozen_order) != set(by_library)
+        ):
+            raise OrchestratorError(
+                "selected RNA BAM evidence libraries differ from the frozen "
+                "configuration; no BAM-reader job was generated"
+            )
+        rows = [by_library[str(library)] for library in frozen_order]
+    else:
+        rows.sort(key=lambda row: library_number_from_name(row["library"]))
+
+    manifest = control / "rna3_bam_evidence_manifest.tsv"
+    manifest_fields = [
+        "library", "library_dir", "bam", "bam_index", "summary",
+        "raw_barcodes", "filtered_barcodes", "raw_features", "raw_matrix",
+        "filtered_matrix", "rg_metadata", "source_order", "scientific_config",
+        "source_order_provenance",
+        "starsolo_feature", "starsolo_umi_filtering", "starsolo_umi_dedup",
+        "starsolo_multimappers", "biological_classification_intent",
+        "old_raw_barcodes", "old_filtered_barcodes", "class_manifest",
+        "native_cell_reads", "output_dir",
+    ]
+    manifest_text = (
+        "\t".join(manifest_fields) + "\n"
+        + "".join(
+            "\t".join(str(row[field]) for field in manifest_fields) + "\n"
+            for row in rows
+        )
+    )
+    frozen_config = _frozen_bam_evidence_config(
+        manifest_fields,
+        rows,
+        source_order_path,
+        source_order_text,
+        source_order_provenance,
+        source_values,
+        baseline_root,
+        class_manifest,
+        args.rna3_bam_evidence_hash_bins,
+        resources.bam_evidence_profiler,
+    )
+    # Freeze every value-affecting input before generating the one full array.
+    if getattr(args, "rna3_bam_evidence_reset_failed_run", False):
+        _reset_failed_bam_evidence_run(
+            run_dir,
+            rows,
+            scientific_config_path,
+            frozen_config,
+            source_order_path,
+            source_order_text,
+            manifest,
+            manifest_text,
+        )
+    else:
+        _validate_or_create_bam_evidence_config(
+            scientific_config_path, frozen_config
+        )
+        _validate_or_create_frozen_text(
+            source_order_path,
+            source_order_text,
+            "RNA BAM evidence source order",
+        )
+        _validate_or_create_frozen_text(
+            manifest, manifest_text, "RNA BAM evidence manifest"
+        )
+    reader_preflight = f"""module purge
+module load miniforge/3 htslib/1.20 samtools/1.20
+module list
+command -v python3
+command -v samtools
+test -x {q(resources.bam_evidence_profiler)}
+{q(resources.bam_evidence_profiler)} --version
+"""
+    # This is a total-process RLIMIT_AS cap in the C++ process, not a molecule
+    # table allowance. Ten percent remains for the Python wrapper/cgroup margin.
+    memory_limit = max(1.0, args.rna3_bam_evidence_memory_gb * 0.90)
+    worker = (
+        f"python3 {q(resources.bam_evidence_runner)} run "
+        f"--manifest {q(manifest)} "
+        f"--profiler {q(resources.bam_evidence_profiler)} "
+        '--threads "$SLURM_CPUS_PER_TASK" '
+        f"--hash-bins {args.rna3_bam_evidence_hash_bins} "
+        f"--hash-seed {DEFAULT_BAM_EVIDENCE_HASH_SEED} "
+        f"--max-memory-gb {memory_limit:.3f}"
+    )
+    logs = run_dir / "logs"
+    slurm_dir = control / "slurm"
+
+    diagnostic_audit = control / "rna3_star_diagnostic_promotion.json"
+    diagnostic_marker = control / "STAR_DIAGNOSTIC_PROMOTION_COMPLETE.ok"
+    diagnostic_script = slurm_dir / "rna3_star_diagnostic_promotion.sbatch"
+    diagnostic_body = (
+        "module purge\n"
+        "module load miniforge/3\n"
+        "module list\n"
+        f"python3 {q(resources.star_diagnostic_promoter)} \\\n"
+        f"    --manifest {q(manifest)} \\\n"
+        f"    --work-root {q(root / 'mapping_project' / 'work')} \\\n"
+        f"    --audit {q(diagnostic_audit)} \\\n"
+        f"    --marker {q(diagnostic_marker)}\n"
+        f"test -s {q(diagnostic_audit)}\n"
+        f"test -s {q(diagnostic_marker)}\n"
+    )
+    write_sbatch(
+        diagnostic_script,
+        sbatch_text(
+            "rna3_star_diagnostics",
+            logs,
+            diagnostic_body,
+            cpus=1,
+            memory="4G",
+            walltime="12:00:00",
+        ),
+    )
+    diagnostic_job = JobSpec(
+        "rna3_star_diagnostics",
+        diagnostic_script,
+        dependencies=list(dependencies),
+    )
+
+    # One invocation submits every selected library as a bounded array and then
+    # runs the BAM-free gather only after both the array and STAR diagnostics
+    # complete successfully.
+    production_cap = min(args.rna3_bam_evidence_max_concurrent, 3)
+    array_script = slurm_dir / "rna3_bam_evidence.sbatch"
+    write_sbatch(
+        array_script,
+        sbatch_text(
+            "rna3_bam_evidence",
+            logs,
+            reader_preflight
+            + worker
+            + ' --row-index "$SLURM_ARRAY_TASK_ID"\n',
+            cpus=args.rna3_bam_evidence_cpus,
+            memory=f"{args.rna3_bam_evidence_memory_gb}G",
+            array=f"0-{len(rows) - 1}%{production_cap}",
+        ),
+    )
+
+    gather_output = run_dir / "qc" / "rna3" / "bam_evidence"
+    gather_script = slurm_dir / "rna3_bam_evidence_gather.sbatch"
+    gather_body = (
+        "module purge\n"
+        + "module load miniforge/3\n"
+        + "module list\n"
+        + f"python3 {q(resources.bam_evidence_runner)} gather \\\n"
+        + f"    --manifest {q(manifest)} \\\n"
+        + f"    --output-dir {q(gather_output)}\n"
+        + f"test -s {q(gather_output / 'BAM_EVIDENCE_GATHER_COMPLETE.ok')}\n"
+    )
+    write_sbatch(
+        gather_script,
+        sbatch_text(
+            "rna3_bam_evidence_gather",
+            logs,
+            gather_body,
+            cpus=2,
+            memory="16G",
+        ),
+    )
+    atomic_json(
+        control / "rna3_bam_evidence_execution.json",
+        {
+            "mode": "direct_full_run",
+            "selected_libraries": [str(row["library"]) for row in rows],
+            "array": f"0-{len(rows) - 1}%{production_cap}",
+            "selected_max_concurrent": production_cap,
+            "default_ceiling": 3,
+            "automatic_gather_after_all_readers": True,
+        },
+    )
+    return [
+        diagnostic_job,
+        JobSpec(
+            "rna3_bam_evidence",
+            array_script,
+            dependencies=list(dependencies),
+        ),
+        JobSpec(
+            "rna3_bam_evidence_gather",
+            gather_script,
+            dependencies=["rna3_star_diagnostics", "rna3_bam_evidence"],
+        ),
+    ]
 
 
 def generate_atac_qc_job(
@@ -1697,12 +2578,13 @@ test -s "$OUT"
 
 def generate_atac_plot_job(
     run_dir: Path,
+    figure_root: Path,
     resources: Resources,
     dependencies: Sequence[str],
 ) -> JobSpec:
     assert resources.atac_plotter is not None
     stats = run_dir / "qc" / "atac" / "stats"
-    out = run_dir / "qc" / "atac" / "plots"
+    out = figure_root / "mapping_QC"
     marker = out / "ATAC_PLOTS_COMPLETE.ok"
     script = run_dir / "control" / "slurm" / "plot_atac_qc.sbatch"
     body = f"""if [[ -s {q(marker)} ]]; then
@@ -1732,6 +2614,101 @@ date -Is > {q(marker)}
     )
 
 
+def rna_library_output_checks(
+    modality: str,
+    library: str,
+    base: Path,
+    bam_evidence: bool = False,
+) -> list[tuple[str, str, str]]:
+    """Return the durable per-library RNA products required before work cleanup."""
+    relative_paths: tuple[str, ...] = (
+        "gex.bam",
+        "gex.bam.bai",
+        "Barcodes.stats",
+        "Features.stats",
+        "Summary.csv",
+        "UMIperCellSorted.txt",
+        "STAR_Log.out",
+        "STAR_Log.final.out",
+        "STAR_SJ.out.tab.gz",
+        "raw/barcodes.tsv.gz",
+        "raw/features.tsv.gz",
+        "raw/matrix.mtx.gz",
+        "filtered/barcodes.tsv.gz",
+        "filtered/features.tsv.gz",
+        "filtered/matrix.mtx.gz",
+    )
+    if bam_evidence:
+        relative_paths += (
+            "bam_evidence/barcode_read_metrics.tsv.gz",
+            "bam_evidence/barcode_rg_metrics.tsv.gz",
+            "bam_evidence/molecule_source_hash_bins.tsv.gz",
+            "bam_evidence/rg_summary.tsv",
+            "bam_evidence/rg_contig_class_summary.tsv.gz",
+            "bam_evidence/raw_to_corrected_barcode_counts.tsv.gz",
+            "bam_evidence/CellReads.countedU.from_bam.tsv.gz",
+            "bam_evidence/audit.json",
+            "bam_evidence/BAM_EVIDENCE_COMPLETE.ok",
+        )
+    else:
+        relative_paths += ("CellReads.stats.gz",)
+    return [
+        (modality, library, str(base / relative_path))
+        for relative_path in relative_paths
+    ]
+
+
+def nextflow_project_output_checks(
+    modality: str,
+    project: Path,
+) -> list[tuple[str, str, str]]:
+    """Return durable execution metadata needed after Nextflow cache removal."""
+    relative_paths = (
+        "MAPPING_COMPLETE.ok",
+        "rg_metadata.tsv",
+        "symlink_manifest.tsv",
+        "params_rna.yml" if modality.startswith("rna") else "params_atac.yml",
+        "nextflow.config",
+        "report.html",
+        "trace.txt",
+        "timeline.html",
+    )
+    return [
+        (f"{modality}_provenance", relative_path, str(project / relative_path))
+        for relative_path in relative_paths
+    ]
+
+
+def nextflow_work_cleanup_targets(
+    inputs: Inputs,
+    discovery: Discovery,
+    run_dir: Path,
+) -> list[tuple[str, str]]:
+    """List cache directories that may be removed manually after validation."""
+    targets: list[tuple[str, str]] = []
+    if inputs.rna3:
+        targets.append(("rna3", str(run_dir / "rna3" / "mapping_project" / "work")))
+    if inputs.rna5:
+        for read_format in ("long-r2", "pe150"):
+            if discovery.rna5_libraries_by_format.get(read_format):
+                targets.append(
+                    (
+                        f"rna5_{read_format}",
+                        str(
+                            run_dir
+                            / "rna5"
+                            / "formats"
+                            / read_format
+                            / "mapping_project"
+                            / "work"
+                        ),
+                    )
+                )
+    if inputs.atac:
+        targets.append(("atac", str(run_dir / "atac" / "mapping_project" / "work")))
+    return targets
+
+
 def validation_checks(
     inputs: Inputs,
     discovery: Discovery,
@@ -1740,26 +2717,48 @@ def validation_checks(
     rna5_map_mode: str,
     include_trim_barcode_qc: bool,
     include_empty_drop_qc: bool,
+    rna3_bam_evidence: bool,
 ) -> list[tuple[str, str, str]]:
     checks: list[tuple[str, str, str]] = []
     if inputs.rna3:
         for library in discovery.libraries.get("rna3", []):
             base = run_dir / "rna3" / "mapping_output" / library
             checks.extend(
-                [
-                    ("rna3", library, str(base / "gex.bam")),
-                    ("rna3", library, str(base / "gex.bam.bai")),
-                    ("rna3", library, str(base / "Summary.csv")),
-                    ("rna3", library, str(base / "raw" / "barcodes.tsv.gz")),
-                    ("rna3", library, str(base / "filtered" / "barcodes.tsv.gz")),
-                ]
+                rna_library_output_checks(
+                    "rna3",
+                    library,
+                    base,
+                    bam_evidence=rna3_bam_evidence,
+                )
             )
         checks.extend(
-            [
-                ("rna3_provenance", "metadata", str(run_dir / "rna3" / "mapping_project" / "rg_metadata.tsv")),
-                ("rna3_provenance", "manifest", str(run_dir / "rna3" / "mapping_project" / "symlink_manifest.tsv")),
-            ]
+            nextflow_project_output_checks(
+                "rna3", run_dir / "rna3" / "mapping_project"
+            )
         )
+        checks.append(
+            ("rna3_provenance", "libs.txt", str(run_dir / "rna3" / "libs.txt"))
+        )
+        checks.append(
+            (
+                "rna3_provenance",
+                "run_mapping.sbatch",
+                str(run_dir / "rna3" / "run_mapping.sbatch"),
+            )
+        )
+        if rna3_bam_evidence:
+            evidence_gather = run_dir / "qc" / "rna3" / "bam_evidence"
+            for relative in (
+                "bam_evidence_inventory.tsv",
+                "all_libraries_rg_summary.tsv.gz",
+                "all_libraries_barcode_summary.tsv.gz",
+                "all_libraries_source_yield.tsv",
+                "project_audit.json",
+                "BAM_EVIDENCE_GATHER_COMPLETE.ok",
+            ):
+                checks.append(
+                    ("rna3_bam_evidence_gather", relative, str(evidence_gather / relative))
+                )
         if include_trim_barcode_qc:
             checks.extend(
                 [
@@ -1782,21 +2781,42 @@ def validation_checks(
                 else:
                     base = run_dir / "rna5" / "formats" / read_format / "mapping_output" / library
                 checks.extend(
-                    [
-                        (f"rna5_{read_format}", library, str(base / "gex.bam")),
-                        (f"rna5_{read_format}", library, str(base / "gex.bam.bai")),
-                        (f"rna5_{read_format}", library, str(base / "Summary.csv")),
-                        (f"rna5_{read_format}", library, str(base / "raw" / "barcodes.tsv.gz")),
-                        (f"rna5_{read_format}", library, str(base / "filtered" / "barcodes.tsv.gz")),
-                    ]
+                    rna_library_output_checks(
+                        f"rna5_{read_format}", library, base
+                    )
                 )
             format_project = run_dir / "rna5" / "formats" / read_format / "mapping_project"
             if discovery.rna5_libraries_by_format.get(read_format):
                 checks.extend(
-                    [
-                        (f"rna5_{read_format}_provenance", "metadata", str(format_project / "rg_metadata.tsv")),
-                        (f"rna5_{read_format}_provenance", "manifest", str(format_project / "symlink_manifest.tsv")),
-                    ]
+                    nextflow_project_output_checks(
+                        f"rna5_{read_format}", format_project
+                    )
+                )
+                checks.append(
+                    (
+                        f"rna5_{read_format}_provenance",
+                        "libs.txt",
+                        str(
+                            run_dir
+                            / "rna5"
+                            / "formats"
+                            / read_format
+                            / "libs.txt"
+                        ),
+                    )
+                )
+                checks.append(
+                    (
+                        f"rna5_{read_format}_provenance",
+                        "run_mapping.sbatch",
+                        str(
+                            run_dir
+                            / "rna5"
+                            / "formats"
+                            / read_format
+                            / "run_mapping.sbatch"
+                        ),
+                    )
                 )
         if include_trim_barcode_qc:
             checks.extend(
@@ -1819,15 +2839,25 @@ def validation_checks(
                 [
                     ("atac", library, str(base / "atac.bam")),
                     ("atac", library, str(base / "atac.bam.bai")),
+                    ("atac", library, str(base / "atac_namesort.bam")),
                     ("atac", library, str(base / "atac_fragments.tsv.gz")),
                     ("atac", library, str(base / "atac_fragments.tsv.gz.tbi")),
                 ]
             )
         checks.extend(
-            [
-                ("atac_provenance", "metadata", str(run_dir / "atac" / "mapping_project" / "rg_metadata.tsv")),
-                ("atac_provenance", "manifest", str(run_dir / "atac" / "mapping_project" / "symlink_manifest.tsv")),
-            ]
+            nextflow_project_output_checks(
+                "atac", run_dir / "atac" / "mapping_project"
+            )
+        )
+        checks.append(
+            ("atac_provenance", "libs.txt", str(run_dir / "atac" / "libs.txt"))
+        )
+        checks.append(
+            (
+                "atac_provenance",
+                "run_atac_mapping.sbatch",
+                str(run_dir / "atac" / "run_atac_mapping.sbatch"),
+            )
         )
         if "qc" in stages:
             for number in discovery.library_numbers.get("atac", []):
@@ -1850,6 +2880,7 @@ def generate_validation_job(
     rna5_map_mode: str,
     include_trim_barcode_qc: bool,
     include_empty_drop_qc: bool,
+    rna3_bam_evidence: bool,
 ) -> JobSpec:
     checks = validation_checks(
         inputs,
@@ -1859,6 +2890,7 @@ def generate_validation_job(
         rna5_map_mode,
         include_trim_barcode_qc,
         include_empty_drop_qc,
+        rna3_bam_evidence,
     )
     check_file = run_dir / "control" / "expected_outputs.tsv"
     atomic_text(
@@ -1866,8 +2898,21 @@ def generate_validation_job(
         "modality\tlibrary\tpath\n"
         + "".join(f"{modality}\t{library}\t{path}\n" for modality, library, path in checks),
     )
+    cleanup_plan = run_dir / "control" / "work_cleanup_targets.tsv"
+    cleanup_targets = nextflow_work_cleanup_targets(inputs, discovery, run_dir)
+    atomic_text(
+        cleanup_plan,
+        "modality\tpath\taction\tconsequence\n"
+        + "".join(
+            f"{modality}\t{path}\tMANUAL_DELETE_ONLY_AFTER_WORK_CLEANUP_READY\t"
+            "removes_nextflow_resume_cache_not_published_results\n"
+            for modality, path in cleanup_targets
+        ),
+    )
     summary = run_dir / "validation" / "output_validation.tsv"
     marker = run_dir / "validation" / "RUN_COMPLETE.ok"
+    cleanup_manifest = run_dir / "validation" / "work_cleanup_targets.tsv"
+    cleanup_marker = run_dir / "validation" / "WORK_CLEANUP_READY.ok"
     script = run_dir / "control" / "slurm" / "validate_run.sbatch"
     body = f"""module purge
 module load htslib/1.20
@@ -1901,7 +2946,15 @@ if [[ "$FAIL" -ne 0 ]]; then
     exit 1
 fi
 date -Is > {q(marker)}
+cp {q(cleanup_plan)} {q(cleanup_manifest)}
+{{
+    printf 'validated_utc\\t'
+    date -Is
+    printf 'cleanup_manifest\\t%s\\n' {q(str(cleanup_manifest))}
+    printf 'policy\\tmanual deletion only; published results are retained; Nextflow resume cache is lost\\n'
+}} > {q(cleanup_marker)}
 echo "Validation passed: {marker}"
+echo "Manual work cleanup is safe: {cleanup_marker}"
 """
     write_sbatch(
         script,
@@ -1997,6 +3050,15 @@ def reused_job_dependency(job_id: str, label: str) -> str | None:
     jobs remain dependencies. A known failed job is never silently reused.
     """
     states = slurm_accounting_states(job_id)
+    # These jobs publish scientific/provenance products consumed by later
+    # RNA-evidence phases.  When accounting no longer proves what happened,
+    # require an explicit resubmission instead of silently releasing their
+    # dependants.  The replacement job then recreates and validates its marker
+    # and audit in the normal job body.
+    requires_accounting_proof = (
+        label.startswith("rna3_bam_evidence")
+        or label == "rna3_star_diagnostics"
+    )
     if states and all(state == "COMPLETED" for state in states):
         print(f"Prior submission already completed: {label} -> job {job_id}")
         return None
@@ -2013,18 +3075,62 @@ def reused_job_dependency(job_id: str, label: str) -> str | None:
         return job_id
 
     if states:
+        if requires_accounting_proof:
+            raise OrchestratorError(
+                f"cannot reuse {label} job {job_id}: SLURM returned only "
+                f"unrecognized state(s) {','.join(sorted(set(states)))}. "
+                f"Add {label} to --resubmit-jobs."
+            )
         print(
             f"WARNING: unrecognized SLURM state for reused job {label} "
             f"({job_id}): {','.join(sorted(set(states)))}; treating its "
             "dependency as already satisfied"
         )
     else:
+        if requires_accounting_proof:
+            raise OrchestratorError(
+                f"cannot reuse {label} job {job_id}: SLURM accounting no "
+                f"longer proves its state. Add {label} to --resubmit-jobs."
+            )
         print(
             f"WARNING: SLURM no longer retains accounting state for reused "
             f"job {label} ({job_id}); treating its dependency as already "
             "satisfied"
         )
     return None
+
+
+def validate_completed_star_diagnostic_reuse(
+    promoter: Path,
+    run_dir: Path,
+) -> None:
+    """Use the promoter's authoritative read-only audit validator on reuse."""
+    control = run_dir / "control"
+    command = [
+        sys.executable,
+        str(promoter),
+        "--validate-only",
+        "--manifest", str(control / "rna3_bam_evidence_manifest.tsv"),
+        "--work-root", str(run_dir / "rna3" / "mapping_project" / "work"),
+        "--audit", str(control / "rna3_star_diagnostic_promotion.json"),
+        "--marker", str(control / "STAR_DIAGNOSTIC_PROMOTION_COMPLETE.ok"),
+    ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, check=False
+        )
+    except OSError as exc:
+        raise OrchestratorError(
+            f"could not validate reused STAR diagnostics: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise OrchestratorError(
+            "completed rna3_star_diagnostics job lacks a current valid "
+            "manifest-bound audit/marker/output set; add "
+            "rna3_star_diagnostics to --resubmit-jobs. "
+            f"Validator detail: {detail}"
+        )
 
 
 def plan_payload(
@@ -2079,12 +3185,17 @@ def print_plan(
     else:
         print("\nMonitor with: squeue -u $USER")
     print(f"Validation marker: {run_dir / 'validation' / 'RUN_COMPLETE.ok'}")
+    print(
+        "Work-cleanup marker: "
+        f"{run_dir / 'validation' / 'WORK_CLEANUP_READY.ok'}"
+    )
 
 
 def restore_prior_job_ids(
     plan_path: Path,
     jobs: Sequence[JobSpec],
     requested_resubmits: Sequence[str] | None,
+    star_diagnostic_promoter: Path | None = None,
 ) -> None:
     """Reuse accepted SLURM IDs and clear explicitly retried dependency branches."""
     if not plan_path.is_file():
@@ -2112,10 +3223,57 @@ def restore_prior_job_ids(
         raise OrchestratorError(
             "--resubmit-jobs contains unknown label(s): " + ", ".join(unknown)
         )
+    for label in sorted(requested):
+        prior_id = prior_ids.get(label)
+        protected = (
+            label.startswith("rna3_bam_evidence")
+            or label == "rna3_star_diagnostics"
+        )
+        if not prior_id or not protected:
+            continue
+        states = slurm_accounting_states(prior_id)
+        active = sorted(set(states).intersection(SLURM_ACTIVE_STATES))
+        unknown_states = sorted(
+            set(states) - SLURM_ACTIVE_STATES - SLURM_FAILURE_STATES
+            - {"COMPLETED"}
+        )
+        if active:
+            raise OrchestratorError(
+                f"cannot resubmit {label} while prior job {prior_id} is "
+                f"active: {','.join(active)}"
+            )
+        if not states or unknown_states:
+            detail = "no state" if not states else ",".join(unknown_states)
+            raise OrchestratorError(
+                f"cannot resubmit {label}: SLURM did not prove prior job "
+                f"{prior_id} terminal ({detail})"
+            )
 
-    # A retried upstream job invalidates every prior downstream submission in
-    # this plan; walk the dependency graph until the descendant set stabilizes.
+    diagnostic_id = prior_ids.get("rna3_star_diagnostics")
+    if (
+        diagnostic_id
+        and "rna3_star_diagnostics" in labels
+        and "rna3_star_diagnostics" not in requested
+    ):
+        diagnostic_states = slurm_accounting_states(diagnostic_id)
+        if diagnostic_states and all(
+            state == "COMPLETED" for state in diagnostic_states
+        ):
+            if star_diagnostic_promoter is None:
+                raise OrchestratorError(
+                    "cannot validate completed rna3_star_diagnostics reuse: "
+                    "promoter path is unavailable"
+                )
+            validate_completed_star_diagnostic_reuse(
+                star_diagnostic_promoter, plan_path.parent.parent
+            )
+
+    # A requested retry or a newly introduced job invalidates every prior
+    # downstream submission in this plan. This prevents an old completed plot
+    # or validation job from being reused when a new reporting stage is added
+    # during --resume.
     retry = set(requested)
+    retry.update(label for label in labels if label not in prior_ids)
     changed = True
     while changed:
         changed = False
@@ -2179,7 +3337,16 @@ def build_parser() -> argparse.ArgumentParser:
             "input paths are also accepted. Dry run is the default; --submit is explicit."
         ),
     )
-    parser.add_argument("--run-name", help="Unique staged run name (required for normal operation)")
+    parser.add_argument(
+        "--run-name",
+        help=("Unique run label. Required unless --run-dir is supplied; with "
+              "--run-dir it must match that directory's basename."),
+    )
+    parser.add_argument(
+        "--run-dir", default=None,
+        help=("Exact absolute output directory. This bypasses the historical "
+              "<staging-root>/<run-name> construction."),
+    )
     parser.add_argument("--rna3-runs", nargs="+", default=None, metavar="RUN")
     parser.add_argument("--atac-runs", nargs="+", default=None, metavar="RUN")
     parser.add_argument("--rna5-runs", nargs="+", default=None, metavar="RUN")
@@ -2213,6 +3380,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--atac-raw-root", default=DEFAULT_ATAC_RAW_ROOT)
     parser.add_argument("--rna5-raw-root", default=DEFAULT_RNA5_RAW_ROOT)
     parser.add_argument("--staging-root", default=DEFAULT_STAGING_ROOT)
+    parser.add_argument(
+        "--rna3-figure-root", default=None,
+        help=("Exact physical root for 3P mapping figures; default: "
+              "3P/figures/<run-name>/Mapping"),
+    )
+    parser.add_argument(
+        "--rna5-figure-root", default=None,
+        help=("Exact physical root for 5P mapping figures; default: "
+              "5P/figures/<run-name>/Mapping"),
+    )
+    parser.add_argument(
+        "--atac-figure-root", default=None,
+        help=("Exact physical root for ATAC mapping figures; default: "
+              "ATAC/figures/<run-name>/Mapping"),
+    )
     parser.add_argument(
         "--stages",
         nargs="+",
@@ -2287,6 +3469,148 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mapping-plotter", default=None)
     parser.add_argument("--atac-collector", default=None)
     parser.add_argument("--atac-plotter", default=None)
+    parser.add_argument(
+        "--rna3-bam-evidence-runner",
+        default=None,
+        help="Override the bundled run_rna_bam_evidence.py helper",
+    )
+    parser.add_argument(
+        "--rna3-bam-evidence-profiler",
+        default=None,
+        help=(
+            "Override the compiled rna_bam_evidence executable; the default is "
+            "the package bin/ sibling or repository-root build"
+        ),
+    )
+    parser.add_argument(
+        "--rna3-star-diagnostic-promoter",
+        default=None,
+        help="Override the bundled promote_rna_star_diagnostics.py helper",
+    )
+
+    parser.add_argument(
+        "--rna3-mapping-baseline-stats",
+        default=None,
+        help=(
+            "Prior RNA processedstats.tsv. When supplied, the RNA mapping plot "
+            "job also writes mapping_delta_dashboard.png and mapping_stats_deltas.tsv."
+        ),
+    )
+    parser.add_argument(
+        "--rna3-mapping-baseline-label",
+        default="Baseline",
+        help="Display label for --rna3-mapping-baseline-stats",
+    )
+    parser.add_argument(
+        "--rna3-mapping-current-label",
+        default="Current",
+        help="Display label for the current 3' RNA mapping statistics",
+    )
+    parser.add_argument(
+        "--rna3-mapping-baseline-root",
+        default=None,
+        help=(
+            "Optional prior RNA mapping_output directory. When supplied, the "
+            "reads-per-cell figure compares native called-cell distributions and "
+            "the per-cell change for shared library/barcode pairs."
+        ),
+    )
+    parser.add_argument(
+        "--rna3-mapping-baseline-work-root",
+        default=None,
+        help=(
+            "Optional prior Nextflow work directory used to recover baseline "
+            "CellReads.stats only when that prior STAR run generated it with "
+            "--soloCellReadStats Standard"
+        ),
+    )
+    parser.add_argument(
+        "--rna3-bam-evidence-from-bam",
+        action="store_true",
+        help=(
+            "Opt in to the compiled one-pass per-barcode/RG/molecule evidence "
+            "profiler, bounded all-library array, and BAM-free gather"
+        ),
+    )
+    parser.add_argument(
+        "--rna3-cell-reads-backfill-from-bam",
+        action="store_true",
+        help=(
+            "Deprecated one-release alias for --rna3-bam-evidence-from-bam; "
+            "it invokes the compiled profiler and never the retired AWK worker"
+        ),
+    )
+    parser.add_argument(
+        "--rna3-bam-evidence-cpus",
+        type=int,
+        default=4,
+        metavar="N",
+        help="CPUs per BAM evidence task (default: 4)",
+    )
+    parser.add_argument(
+        "--rna3-bam-evidence-memory-gb",
+        type=int,
+        default=48,
+        metavar="N",
+        help="SLURM memory in GiB per BAM evidence task (default: 48)",
+    )
+    parser.add_argument(
+        "--rna3-bam-evidence-max-concurrent",
+        type=int,
+        default=3,
+        metavar="N",
+        help=(
+            "Maximum simultaneous large BAM readers in the full array "
+            "(default: 3)"
+        ),
+    )
+    parser.add_argument(
+        "--rna3-bam-evidence-reset-failed-run",
+        dest="rna3_bam_evidence_reset_failed_run",
+        action="store_true",
+        help=(
+            "After all prior RNA-evidence jobs are terminal, archive their "
+            "outputs and obsolete frozen configuration before a clean full rerun"
+        ),
+    )
+    parser.add_argument(
+        "--rna3-bam-evidence-baseline-root",
+        default=None,
+        help="Optional historical mapping_output root for exact old barcode rosters",
+    )
+    parser.add_argument(
+        "--rna3-bam-evidence-source-order",
+        nargs="+",
+        default=None,
+        metavar="SOURCE",
+        help=(
+            "Explicit chronological bp_id order. Default: preserve the original "
+            "--rna3-runs argument order"
+        ),
+    )
+    parser.add_argument(
+        "--rna3-bam-evidence-hash-bins",
+        type=int,
+        default=100,
+        metavar="N",
+        help="Nested stable minimum-QNAME-hash bins (default: 100)",
+    )
+    parser.add_argument(
+        "--rna3-bam-evidence-class-manifest",
+        default=None,
+        help=(
+            "TSV with validated contig and/or feature/GX biological classes"
+        ),
+    )
+    parser.add_argument(
+        "--rna3-bam-evidence-no-biological-classification",
+        action="store_true",
+        help=(
+            "Explicitly acknowledge that mitochondrial/rRNA/species values will "
+            "be unavailable. One of this flag or --rna3-bam-evidence-class-manifest "
+            "is mandatory."
+        ),
+    )
 
     parser.add_argument("--rna-mem-gb", default="80")
     parser.add_argument("--rna-threads", type=int, default=8)
@@ -2368,9 +3692,50 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def orchestrate(args: argparse.Namespace) -> int:
-    if not args.run_name:
-        raise OrchestratorError("--run-name is required")
+    requested_run_dir = None
+    if args.run_dir:
+        requested_run_dir = Path(args.run_dir).expanduser()
+        if not requested_run_dir.is_absolute():
+            raise OrchestratorError("--run-dir must be an absolute path")
+        requested_run_dir = requested_run_dir.resolve(strict=False)
+        if args.run_name and args.run_name != requested_run_dir.name:
+            raise OrchestratorError(
+                "--run-name must match the basename of --run-dir")
+        if not args.run_name:
+            args.run_name = requested_run_dir.name
+    elif not args.run_name:
+        raise OrchestratorError("--run-name or --run-dir is required")
+    if args.rna3_cell_reads_backfill_from_bam:
+        print(
+            "WARNING: --rna3-cell-reads-backfill-from-bam is deprecated; "
+            "running --rna3-bam-evidence-from-bam with the compiled profiler",
+            file=sys.stderr,
+        )
+        args.rna3_bam_evidence_from_bam = True
     args.run_name = safe_run_name(args.run_name)
+    run_dir = (
+        requested_run_dir
+        if requested_run_dir is not None
+        else Path(args.staging_root).expanduser().resolve(strict=False)
+        / args.run_name
+    )
+    args.run_dir = str(run_dir)
+    figure_defaults = (
+        ("--rna3-figure-root", "rna3_figure_root",
+         DEFAULT_RNA3_FIGURE_BASE),
+        ("--rna5-figure-root", "rna5_figure_root",
+         DEFAULT_RNA5_FIGURE_BASE),
+        ("--atac-figure-root", "atac_figure_root",
+         DEFAULT_ATAC_FIGURE_BASE),
+    )
+    for option, attribute, default_base in figure_defaults:
+        supplied = getattr(args, attribute)
+        value = Path(
+            supplied or os.path.join(default_base, args.run_name, "Mapping")
+        ).expanduser()
+        if not value.is_absolute():
+            raise OrchestratorError(f"{option} must be an absolute path")
+        setattr(args, attribute, str(value.resolve(strict=False)))
     stages = parse_stages(args.stages)
     inputs = Inputs(
         rna3=resolve_runs(args.rna3_runs, args.rna3_raw_root),
@@ -2406,8 +3771,89 @@ def orchestrate(args: argparse.Namespace) -> int:
         args.nodelist = safe_nodelist(args.nodelist)
     if args.array_max_concurrent is not None and args.array_max_concurrent < 1:
         raise OrchestratorError("--array-max-concurrent must be at least 1")
+    if args.rna3_bam_evidence_cpus < 2:
+        raise OrchestratorError("--rna3-bam-evidence-cpus must be at least 2")
+    if args.rna3_bam_evidence_memory_gb < 4:
+        raise OrchestratorError("--rna3-bam-evidence-memory-gb must be at least 4")
+    if args.rna3_bam_evidence_max_concurrent < 1:
+        raise OrchestratorError(
+            "--rna3-bam-evidence-max-concurrent must be at least 1"
+        )
+    if args.rna3_bam_evidence_max_concurrent > 3:
+        raise OrchestratorError(
+            "--rna3-bam-evidence-max-concurrent may not exceed the audited ceiling of 3"
+        )
+    if args.rna3_bam_evidence_hash_bins < 1:
+        raise OrchestratorError("--rna3-bam-evidence-hash-bins must be positive")
+    if args.rna3_bam_evidence_from_bam:
+        if not inputs.rna3:
+            raise OrchestratorError(
+                "--rna3-bam-evidence-from-bam requires a 3' RNA input"
+            )
+        if bool(args.rna3_bam_evidence_class_manifest) == bool(
+            args.rna3_bam_evidence_no_biological_classification
+        ):
+            raise OrchestratorError(
+                "RNA BAM evidence requires exactly one of "
+                "--rna3-bam-evidence-class-manifest or "
+                "--rna3-bam-evidence-no-biological-classification"
+            )
+        if args.rna3_bam_evidence_baseline_root:
+            args.rna3_bam_evidence_baseline_root = str(
+                Path(args.rna3_bam_evidence_baseline_root)
+                .expanduser()
+                .resolve(strict=False)
+            )
+        if args.rna3_bam_evidence_class_manifest:
+            args.rna3_bam_evidence_class_manifest = str(
+                Path(args.rna3_bam_evidence_class_manifest)
+                .expanduser()
+                .resolve(strict=False)
+            )
+    if args.rna3_mapping_baseline_stats:
+        if not inputs.rna3:
+            raise OrchestratorError(
+                "--rna3-mapping-baseline-stats requires a 3' RNA input"
+            )
+        if "plot" not in stages:
+            raise OrchestratorError(
+                "--rna3-mapping-baseline-stats requires the plot stage"
+            )
+        args.rna3_mapping_baseline_stats = str(
+            Path(args.rna3_mapping_baseline_stats)
+            .expanduser()
+            .resolve(strict=False)
+        )
+    if args.rna3_mapping_baseline_root:
+        if not inputs.rna3:
+            raise OrchestratorError(
+                "--rna3-mapping-baseline-root requires a 3' RNA input"
+            )
+        if "plot" not in stages:
+            raise OrchestratorError(
+                "--rna3-mapping-baseline-root requires the plot stage"
+            )
+        args.rna3_mapping_baseline_root = str(
+            Path(args.rna3_mapping_baseline_root)
+            .expanduser()
+            .resolve(strict=False)
+        )
+    if args.rna3_mapping_baseline_work_root:
+        if not args.rna3_mapping_baseline_root:
+            raise OrchestratorError(
+                "--rna3-mapping-baseline-work-root requires "
+                "--rna3-mapping-baseline-root"
+            )
+        args.rna3_mapping_baseline_work_root = str(
+            Path(args.rna3_mapping_baseline_work_root)
+            .expanduser()
+            .resolve(strict=False)
+        )
+    if not args.rna3_mapping_baseline_label.strip():
+        raise OrchestratorError("--rna3-mapping-baseline-label may not be empty")
+    if not args.rna3_mapping_current_label.strip():
+        raise OrchestratorError("--rna3-mapping-current-label may not be empty")
 
-    run_dir = Path(args.staging_root).expanduser().resolve(strict=False) / args.run_name
     resources = resolve_resources(args)
     discovery, failures, warnings = discover(
         inputs,
@@ -2454,6 +3900,10 @@ def orchestrate(args: argparse.Namespace) -> int:
             f"preflight found {len(failures)} blocking problem(s); no jobs were generated"
         )
 
+    # Keep this handle live through the final sbatch/plan write. The advisory
+    # lock prevents concurrent phase invocations from interleaving plans and
+    # releasing readers against different continuation records.
+    _run_lock = acquire_run_lock(run_dir)
     payload = config_payload(args, inputs, resources, discovery)
     prepare_run_directory(run_dir, args.resume, payload, args.resubmit_jobs)
 
@@ -2526,12 +3976,30 @@ def orchestrate(args: argparse.Namespace) -> int:
             )
         )
 
+    if args.rna3_bam_evidence_from_bam:
+        current_labels = {job.label for job in jobs}
+        jobs.extend(
+            generate_rna_bam_evidence_jobs(
+                discovery.libraries.get("rna3", []),
+                run_dir / "rna3",
+                run_dir,
+                args,
+                resources,
+                ["rna3_map"] if "rna3_map" in current_labels else [],
+                [path.name for path in inputs.rna3],
+            )
+        )
+
     if "qc" in stages and not args.no_trim_info:
         if rna3_groups:
             rna3_dependencies = sorted(
                 job.label
                 for job in jobs
-                if job.label.startswith("rna3_trim_") or job.label == "rna3_map"
+                if (
+                    job.label.startswith("rna3_trim_")
+                    or job.label == "rna3_map"
+                    or job.label == "rna3_bam_evidence_gather"
+                )
             )
             jobs.extend(
                 generate_barcode_trim_jobs(
@@ -2544,6 +4012,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                     run_dir,
                     resources,
                     rna3_dependencies,
+                    use_evidence_bridge=args.rna3_bam_evidence_from_bam,
                 )
             )
         if rna5_groups:
@@ -2580,18 +4049,28 @@ def orchestrate(args: argparse.Namespace) -> int:
                     "rna3",
                     run_dir / "rna3",
                     run_dir,
+                    Path(args.rna3_figure_root),
                     resources,
                     trim_dependencies,
                 )
             )
-            map_dependencies = ["rna3_map"] if "rna3_map" in labels else []
+            if "rna3_bam_evidence_gather" in labels:
+                map_dependencies = ["rna3_bam_evidence_gather"]
+            else:
+                map_dependencies = ["rna3_map"] if "rna3_map" in labels else []
             jobs.append(
                 generate_mapping_plot_job(
                     "rna3",
                     run_dir / "rna3",
                     run_dir,
+                    Path(args.rna3_figure_root),
                     resources,
                     map_dependencies,
+                    baseline_stats=args.rna3_mapping_baseline_stats,
+                    baseline_label=args.rna3_mapping_baseline_label,
+                    current_label=args.rna3_mapping_current_label,
+                    baseline_base_path=args.rna3_mapping_baseline_root,
+                    baseline_cell_reads_work_root=args.rna3_mapping_baseline_work_root,
                 )
             )
         for read_format, _runs, root in rna5_groups:
@@ -2601,7 +4080,9 @@ def orchestrate(args: argparse.Namespace) -> int:
             )
             jobs.append(
                 generate_trim_plot_job(
-                    modality_label, root, run_dir, resources, trim_dependencies
+                    modality_label, root, run_dir,
+                    Path(args.rna5_figure_root) / "formats" / read_format,
+                    resources, trim_dependencies
                 )
             )
             if args.rna5_map_mode == "separate":
@@ -2611,6 +4092,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                         modality_label,
                         root,
                         run_dir,
+                        Path(args.rna5_figure_root) / "formats" / read_format,
                         resources,
                         [map_label] if map_label in labels else [],
                     )
@@ -2621,6 +4103,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                     "rna5",
                     run_dir / "rna5",
                     run_dir,
+                    Path(args.rna5_figure_root) / "together",
                     resources,
                     ["rna5_together_view"] if "rna5_together_view" in labels else [],
                 )
@@ -2653,7 +4136,9 @@ def orchestrate(args: argparse.Namespace) -> int:
         )
     if inputs.atac and "plot" in stages:
         plot_dependencies = ["atac_qc"] if "atac_qc" in {job.label for job in jobs} else []
-        jobs.append(generate_atac_plot_job(run_dir, resources, plot_dependencies))
+        jobs.append(generate_atac_plot_job(
+            run_dir, Path(args.atac_figure_root), resources,
+            plot_dependencies))
 
     if "validate" in stages:
         current_labels = [job.label for job in jobs]
@@ -2667,6 +4152,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                 args.rna5_map_mode,
                 bool("qc" in stages and not args.no_trim_info),
                 bool(args.empty_drop_roster),
+                args.rna3_bam_evidence_from_bam,
             )
         )
 
@@ -2685,7 +4171,12 @@ def orchestrate(args: argparse.Namespace) -> int:
 
     plan_path = run_dir / "control" / "job_plan.json"
     if args.resume:
-        restore_prior_job_ids(plan_path, jobs, args.resubmit_jobs)
+        restore_prior_job_ids(
+            plan_path,
+            jobs,
+            args.resubmit_jobs,
+            resources.star_diagnostic_promoter,
+        )
     atomic_json(
         plan_path,
         plan_payload(

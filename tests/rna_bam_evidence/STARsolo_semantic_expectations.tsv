@@ -1,0 +1,26 @@
+record_id	qname	flag	HI	NH	ordinary_candidate_read	ordinary_matrix_tag_record	ordinary_new_molecule	nh_gt1_unique_gene_ordinary_read	true_multigene_em_candidate_read	em_G2_mass	em_G3_mass	note
+q01_primary	q01	0	1	1	1	1	1	0	0	0	0	ordinary G1/A molecule
+q02_primary	q02	0	1	1	1	1	0	0	0	0	0	duplicate ordinary molecule across source
+q03_primary	q03	0	1	1	1	1	1	0	0	0	0	ordinary G2/A molecule
+q04_primary	q04	0	1	1	1	1	0	0	0	0	0	duplicate ordinary molecule
+q05_primary	q05	0	1	1	1	1	1	0	0	0	0	ordinary G1/C molecule
+q06_primary	q06	0	1	1	1	1	1	0	0	0	0	ordinary second G1/C UMI
+q07_primary	q07	0	1	1	1	1	1	0	0	0	0	ordinary second G1/A UMI
+q08_primary	q08	0	1	2	0	0	0	0	0	0	0	NH2 unique-gene read whose primary alignment has GX '-'
+q08_secondary	q08	256	2	2	1	1	1	1	0	0	0	secondary alignment exposes the accepted unique G1 assignment
+q01_supplementary	q01	2048	1	1	0	1	0	0	0	0	0	supplementary record duplicates q01 molecule and read
+q11_primary_duplicate_flag	q11	1024	1	1	1	1	0	0	0	0	0	BAM duplicate flag does not define STARsolo molecule duplication
+q12_primary_qcfail_flag	q12	512	1	1	1	1	0	0	0	0	0	QC-fail flag retained by this semantic fixture
+q13_primary	q13	0	1	1	0	0	0	0	0	0	0	missing CB/GX/UB
+q16_primary	q16	0	1	1	0	0	0	0	0	0	0	non-feature read retained only for within-RG correction conflict
+q17_primary	q17	0	1	1	0	0	0	0	0	0	0	non-feature read retained only for within-RG correction conflict
+q18_primary	q18	0	1	1	1	1	0	0	0	0	0	1MM_CR raw UR differs but corrected UB matches q01
+q19_primary	q19	0	1	1	1	0	0	0	0	0	0	unique-gene countedU read whose UMI is later rejected by MultiGeneUMI_CR
+q20_primary	q20	0	1	1	1	0	0	0	0	0	0	second unique-gene countedU read in the rejected equal-support UMI pair
+q21_primary	q21	0	1	1	0	0	0	0	0	0	0	non-feature exact RG2 correction remains usable despite RG1 ambiguity
+q22_primary	q22	0	1	2	0	0	0	0	1	0.5	0.5	true multi-gene G2/G3 EM read; uppercase GX is '-'
+q22_secondary	q22	256	2	2	0	0	0	0	0	0	0	second genomic alignment of the true multi-gene EM read
+q23_read1	q23	99	1	1	1	1	1	0	0	0	0	paired NH1 read contributes one new G1/C molecule
+q23_read2	q23	147	1	1	0	1	0	0	0	0	0	second mate duplicates q23 read and molecule
+q14_primary	q14	0	1	1	1	1	1	0	0	0	0	ordinary mitochondrial feature molecule
+q15_primary	q15	0	1	1	1	1	1	0	0	0	0	ordinary rRNA feature molecule

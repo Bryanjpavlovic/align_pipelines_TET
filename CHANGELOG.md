@@ -5,6 +5,257 @@ documentation, and packaging changes relative to the supplied original
 `nkschaefer/align_pipelines` repository copies. It replaces the former RNA-only
 changelog and the historical `align_rna.nf` backup files.
 
+## 2026-09-05 - One-pass RNA BAM evidence profiler and analysis layer
+
+- Removed the pilot, reader benchmark, continuation-audit, and phase-release
+  machinery. One invocation now submits every selected library in a single
+  array capped at three concurrent readers, followed automatically by BAM-free
+  gather and the existing downstream dependency chain. Failed-run recovery
+  first proves prior jobs terminal, then moves partial evidence and gathered
+  outputs into a timestamped archive before regenerating the complete array.
+- Repaired the first real-cluster reconciliation failure. The initial release
+  incorrectly treated `NH=1` as the boundary of ordinary STARsolo evidence and
+  therefore omitted `NH>1` reads whose annotation union resolves to one gene.
+  Ordinary counted reads and matrix molecules are now NH-unrestricted. The
+  separately reported `nh_gt1_unique_gene_countedU_reads` value is explicitly
+  an ordinary singleton-gene subset; exact multi-gene EM evidence remains
+  unavailable from the standard uppercase `GX`/`UB` BAM tags.
+- A nonblocking per-library lock prevents concurrent publishers, while normal
+  resume reuses only fully validated same-signature outputs.
+- Corrected htslib 1.20 header access, coordinate-sorted the compiled test
+  fixture before indexing, and replaced the unsupported `samtools idxstats -X`
+  preflight with a `samtools view -c -X` region probe that opens the exact
+  manifest-declared BAM index. Documented the required `genomics-base/latest`
+  test environment and added direct custom-index regressions.
+- Added the C++17 `rna_bam_evidence` target. It decodes each coordinate-sorted
+  BAM exactly once through htslib, uses threaded BGZF decompression, validates
+  `RG CB CR GX GN UB UR NH AS nM`, and emits barcode, RG, numeric contig,
+  correction, and aggregate molecule evidence without per-read output.
+- Split STARsolo semantics explicitly. Ordinary counted reads are one logical
+  `(RG,QNAME)` with a declared RG, valid `CB`, and a single feature-roster `GX`;
+  NH=1 uses one fragment representative, while NH>1 merges primary/secondary
+  records so a secondary-only `GX` is retained. They do not require an accepted
+  `UB`. Ordinary molecules are distinct `(CB,GX,accepted-corrected-UB)` tuples
+  across all mapped records and are also NH-unrestricted. The
+  manifest and compiled process are bound to `GeneFull_Ex50pAS`,
+  `MultiGeneUMI_CR`, `1MM_CR`, and `EM` before the BAM is opened. The
+  `nh_gt1_unique_gene_countedU_reads` field is an ordinary unique-gene subset,
+  not an EM metric; exact multi-gene EM evidence is explicitly unavailable. The
+  compiled process
+  merge-checks every raw and filtered MatrixMarket coordinate and count, while
+  the wrapper checks Summary and filtered-cell equalities before publication.
+- Replaced string-tree hot-loop lookups with reserved numeric interners and
+  open-addressed tables, reused tag decoding, and replaced contig maps with a
+  dense RG-by-contig vector. Each record's numeric contribution, including its
+  CIGAR walk, is computed once and reused across library, RG, barcode, and
+  contig accumulators. Molecules, barcode metrics, barcode-RG metrics,
+  correction aggregates, interners, rehash peaks, and output sorting share a
+  conservative process admission budget. A whole-process `RLIMIT_AS` guard,
+  runtime/allocator reserve, complete MaxRSS, component peaks, and relevant
+  cardinalities are recorded. Hash-bin aggregation and high-cardinality sorts
+  reuse compacted storage in place.
+- Reworked `run_rna_bam_evidence.py` validation and BAM-free gather as sorted
+  adjacent-key and merge-style streams. Resume now revalidates every source and
+  gathered output for readability, schema, sort order, row count, byte size,
+  and SHA-256 before reporting success. Only filtered-cell vectors and small
+  RG/library summaries remain in memory.
+- Bound every reader audit to the Slurm allocation and array task that actually
+  produced it. Failed-run reset refuses active or unprovable prior reader jobs,
+  and gather continues to validate every manifest row, audit, product schema,
+  row count, and checksum before publication.
+- Removed `align_pipelines/bjp` and Nextflow from BAM-reader job module loads;
+  the jobs use only miniforge, htslib 1.20, and samtools 1.20 and invoke the
+  frozen profiler by absolute path. This avoids the package module's unrelated
+  conda `libcurl`/toolchain contamination.
+- Restored STAR diagnostic promotion as a lightweight independent step that
+  publishes `STAR_Log.out`, `STAR_Log.final.out`, and `STAR_SJ.out.tab.gz` from
+  an unambiguous retained task matched by Summary SHA-256. It opens no BAM,
+  invokes no retired AWK scanner, and never deletes the work directory. Reuse
+  now independently verifies a manifest-bound audit/marker and all output
+  hashes; unproven preexisting files or a completed Slurm ID are insufficient.
+- Added explicit within-RG, cross-RG, and global raw-to-corrected barcode
+  conflict fields. Exact RG trim joins reject only within-RG ambiguity and do
+  not discard a valid mapping because another RG differs.
+- Added validated contig and feature/GX classification. Missing classification
+  produces blank mitochondrial/rRNA values and explicit `unavailable` status,
+  never numeric zero. The orchestrator requires either a manifest or a clear
+  no-classification acknowledgment before any BAM pass.
+- Reworked gained-cell analysis into independent disk-backed library shards.
+  It details all shared/gained/lost cells, samples only evidence-bearing
+  background barcodes, and computes exact bounded histograms from the complete
+  evidence-bearing population. Depth history uses fixed-roster numeric vectors
+  and keeps observed endpoints, RG-prefix threshold proxies, and final-BAM
+  random-thinning proxies separately labelled.
+- Added true category histogram and quantile tables plus separate cell-count,
+  fixed-roster UMI/read, source-yield, and six-panel library figures. All bins,
+  quantiles, and trajectories are exported as TSV instead of substituting bars
+  of category medians.
+- Expanded tests for the exact focus set, a source-derived post-STARsolo SAM
+  and MatrixMarket contract with NH>1 ordinary inclusion and EM unavailability,
+  one-mismatch raw `UR`
+  collapse to a corrected `UB`, and `MultiGeneUMI_CR` rejection, real-htslib
+  compilation when available, one-thread versus multithread invariance, both conflict scopes,
+  unavailable classes, corrupt and missing resume products, 120,000-row
+  streaming validation, diagnostic promotion, and direct bounded full-array
+  generation.
+  Real compiled tests skip explicitly when this environment lacks htslib or
+  samtools and never use fake declarations.
+
+## 2026-09-04 — Validated parallel backfill for historical RNA mappings
+
+- Clarified the retention boundary. RNA `gex.bam`, its index, raw and filtered
+  matrices, `Barcodes.stats`, `Features.stats`, `Summary.csv`, and
+  `UMIperCellSorted.txt` were already published to each library's final
+  `mapping_output/<library>/` directory; they are not copied again.
+- Added `--rna3-cell-reads-backfill-from-bam` for completed 3' RNA mappings
+  made before native `CellReads.stats` was enabled. The mode streams each
+  published `gex.bam` through `samtools` and `awk` without creating an
+  intermediate SAM or BAM copy, and writes
+  `CellReads.countedU.from_bam.tsv.gz` beside the BAM.
+- BAM-derived counts use one primary alignment per read (`-F 2304`) and require
+  a called `CB` plus nonmissing `GX` and `UB` tags. A result is published only
+  if its barcode set, cell count, summed unique gene-assigned reads, and
+  STAR-style median exactly reproduce the library's `filtered/barcodes.tsv.gz`
+  and `Summary.csv`. An audit JSON and completion marker record the successful
+  validation; the file is deliberately not named native `CellReads.stats`
+  because its other diagnostic columns cannot be reconstructed from the BAM.
+- Backfill is scheduled as a smallest-BAM pilot followed by a per-library
+  SLURM array. The default task uses four CPUs, the array is capped at eight
+  simultaneous libraries to bound shared-filesystem traffic, and the existing
+  global array throttle can impose a stricter cap. One failed pilot therefore
+  blocks the remaining scans instead of wasting work across every library.
+- The same worker identifies the successful historical Nextflow task by an
+  exact `Summary.csv` checksum and atomically promotes the previously stranded
+  `STAR_Log.out`, `STAR_Log.final.out`, and `STAR_SJ.out.tab.gz` into that
+  library's final mapping directory. Ambiguous or unverified work-task matches
+  are fatal.
+- The mapping plotter accepts either future native `CellReads.stats.gz` or the
+  explicitly named and validated BAM-derived table. Mapping plots depend on
+  completion of the backfill branch, and final validation requires its table,
+  audit record, completion marker, and promoted STAR diagnostics.
+- Resume planning now treats a newly introduced job label as a new upstream
+  branch and automatically invalidates its prior downstream plot/validation
+  submissions. Previously completed trimming and mapping job IDs remain
+  reusable.
+
+## 2026-09-04 — Durable mapping outputs and manual work-cache cleanup
+
+- Established that a completed mapping run must remain scientifically usable
+  after its Nextflow `work/` directory is manually deleted. The orchestrator
+  never deletes a work directory automatically.
+- Corrected the cell-read-statistics implementation. STAR defaults
+  `--soloCellReadStats` to `None`, so merely declaring `CellReads.stats` as a
+  Nextflow output could not create the file. RNA mapping now explicitly passes
+  `--soloCellReadStats Standard`, compresses the resulting table, and publishes
+  `CellReads.stats.gz` within every library directory.
+- RNA mapping now also publishes the small STAR products that are useful for
+  audit and reanalysis but were previously stranded in `work/`:
+  `STAR_Log.out`, `STAR_Log.final.out`, and `STAR_SJ.out.tab.gz`.
+- Expanded final validation to require the BAM and index, complete raw and
+  filtered STARsolo matrices, aggregate statistics, per-cell read statistics,
+  STAR logs, splice-junction table, source/read-group manifests, exact
+  Nextflow parameters and configuration, execution report/trace/timeline, and
+  generated mapping submission script. ATAC validation now also requires the
+  published name-sorted BAM.
+- Successful validation writes
+  `validation/WORK_CLEANUP_READY.ok` and
+  `validation/work_cleanup_targets.tsv`. These identify the exact work-cache
+  directories that may then be deleted manually and explicitly warn that doing
+  so removes Nextflow resume capability while leaving published results intact.
+- Reference-index copies, input symlinks, decompressed whitelist copies,
+  temporary sort data, Nextflow task wrappers, split FASTQs, per-source BAMs,
+  pre-mark-duplicate BAMs, and other reconstructable intermediates remain
+  work-cache products and are not copied into permanent output directories.
+- Historical RNA mappings that did not request
+  `--soloCellReadStats Standard` never created `CellReads.stats`; keeping their
+  work directories cannot recover a file that STAR did not generate. Such runs
+  require a validated BAM-derived backfill or mapping regeneration for an exact
+  cell-level read distribution.
+
+## 2026-09-04 — Cell-level RNA read distributions
+
+- Added `reads_per_cell_distribution.png`, a cell-level view of the exact
+  unique GeneFull_Ex50pAS-assigned read counts used by STARsolo for its
+  `Median Reads per Cell` summary statistic. The figure combines a histogram
+  and KDE across called cells with a 50,000-read reference line.
+- Added a second panel showing the 10th percentile, interquartile range,
+  median, and 90th percentile for every library. When a prior mapping root is
+  supplied, this panel instead shows the distribution of read-count gains for
+  the same library/barcode pairs in both snapshots.
+- Added `reads_per_cell.tsv.gz`, preserving every plotted library, called-cell
+  barcode, snapshot label, and read count for downstream analysis.
+- Read distributions are taken from the `countedU` column of STARsolo's
+  `CellReads.stats`, joined to `filtered/barcodes.tsv[.gz]`. Before plotting,
+  every library must exactly reproduce the cell count, unique-read total, and
+  median recorded in its `Summary.csv`; mismatches are fatal.
+- Updated `workflows/align_rna.nf` to publish `CellReads.stats.gz` with each
+  library for future mappings. The plotter may also recover a legacy copy from
+  a retained Nextflow work directory, but only when that historical STAR run
+  explicitly requested cell-read statistics and therefore created the file.
+- The orchestrator now requests and verifies the cell-read TSV and PNG in the
+  normal RNA mapping plot job. Added optional
+  `--rna3-mapping-baseline-root` and
+  `--rna3-mapping-baseline-work-root` controls for old-to-new cell-level
+  comparisons.
+- Histograms always use all called cells. KDE rendering uses a deterministic
+  maximum of 100,000 cells per snapshot, and displayed axes stop at the 99.5th
+  percentile to keep long tails from obscuring the main distribution.
+
+## 2026-09-04 — Longitudinal RNA mapping deltas
+
+- Added optional old-to-new comparison support to
+  `scripts/mapping/plot_mapping_stats_V5.py`. A prior `processedstats.tsv` can
+  now be supplied with `--baseline-stats`; `--current-stats` also permits a
+  comparison to be regenerated directly from two saved statistics tables.
+- Added `mapping_delta_dashboard.png`, showing baseline plus added median
+  reads per cell, the change in estimated cell count, baseline versus current
+  sequencing saturation, and changes in median UMIs and genes per cell.
+- Added `mapping_stats_deltas.tsv`, an exact long-form table containing the
+  baseline, current, absolute delta, and percent delta for every shared numeric
+  metric and library.
+- Added the orchestrator options `--rna3-mapping-baseline-stats`,
+  `--rna3-mapping-baseline-label`, and `--rna3-mapping-current-label`. These
+  pass the comparison into the normal RNA mapping plot job; no standalone or
+  manually sequenced plotting step is required.
+- Treat reporting options as warning-only runtime configuration during
+  `--resume`, so a baseline can be added to an existing mapping run without
+  invalidating completed trimming or mapping work.
+- Require the mapping plot job to verify every requested PNG and TSV before it
+  writes `MAPPING_PLOTS_COMPLETE.ok`. Plot-generation exceptions now cause a
+  nonzero exit instead of being silently converted into a successful job.
+- Corrected existing panels that were labelled as medians but read the
+  corresponding mean columns. Cell-quality, complexity, and the reads-per-cell
+  annotation in the saturation panel now use the actual median columns.
+- Sequencing saturation remains a non-additive rate and is therefore compared
+  between snapshots rather than divided into stacked run components. Source
+  read-group contributions require a separate BAM-derived read-count product;
+  cumulative cell-count convergence requires cell calling at each cumulative
+  sequencing depth.
+
+## 2026-09-01 — Calibrated per-library RNA memory
+
+- Replaced the fixed RNA `map_rna` SLURM allocation with an input-sized request
+  based on the combined compressed size of each library's trimmed R1 and R2
+  FASTQs. The calibration used 36 completed TET RNA libraries and four
+  independently observed 80 GiB OOM libraries.
+- The completed-library fit was `peak RSS GiB = 1.459 + 0.22318 × trimmed GiB`
+  (`R² = 0.9963`; residual standard error 0.77 GiB; largest leave-one-library-out
+  underprediction 2.62 GiB). The deployed rule deliberately uses the higher
+  empirical envelope `4 + 0.224 × trimmed GiB`, adds 25% operational headroom,
+  and rounds upward to an 8 GiB scheduling bucket.
+- `--memgb` remains a user-controlled minimum allocation. With the established
+  80 GiB floor, the four OOM libraries are initially assigned 112 GiB (library
+  38), 112 GiB (library 2), 120 GiB (library 36), and 136 GiB (library 1).
+- An actual OOM retry adds 32 GiB to the library-specific request for each
+  subsequent attempt. Non-memory failures still terminate immediately.
+- Removed fixed memory declarations from the generated per-run
+  `nextflow.config`; those declarations overrode the workflow's dynamic
+  resource directive and would otherwise silently disable the estimator.
+- Kept STAR's established `--limitBAMsortRAM` calculation based on `--memgb`.
+  This preserves the mapping command and Nextflow cache identity for completed
+  libraries, and it matches the exact STAR behavior used to calibrate the
+  allocation model. Only the SLURM allocation changes.
+
 ## 2026-08-30 — Restore historical 3′ TSO matching
 
 - Reverted the 3′ RNA front-adapter definition in

@@ -1,384 +1,573 @@
 #include <getopt.h>
-#include <argp.h>
 #include <zlib.h>
-#include <string>
-#include <algorithm>
-#include <vector>
-#include <iterator>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <iostream>
-#include <sys/stat.h>
-#include <fstream>
-#include <sstream>
-#include <map>
-#include <set>
-#include <cstdlib>
-#include <utility>
-#include <math.h>
+
 #include <htslib/kseq.h>
-#include <zlib.h>
 
-using std::cout;
-using std::endl;
-using namespace std;
+#include <cerrno>
+#include <climits>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <set>
+#include <sstream>
+#include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <utility>
+#include <vector>
 
-/**
- * Print a help message to the terminal and exit.
- */
-void help(int code){
-    fprintf(stderr, "split_read_files [OPTIONS]\n");
-    fprintf(stderr, "Given a single fastq file or a pair (F and R), and a number of chunks to create, splits the file into that many chunks, so \
-processing can be run more efficiently on a cluster.\n");
-    fprintf(stderr, "[OPTIONS]:\n");
-    fprintf(stderr, "    --r1 -1 The input file for forward, paired reads\n");
-    fprintf(stderr, "    --r2 -2 The input file for reverse, paired reads\n");
-    fprintf(stderr, "    --r3 -3 The third read file in read triplets, i.e. single-cell ATAC-seq\n");
-    fprintf(stderr, "    --single -s The input file for unpaired reads\n");
-    fprintf(stderr, "    --output_directory -o The output directory for split files\n");
-    fprintf(stderr, "    --num_chunks -n The number of smaller read files to create\n");
-    fprintf(stderr, "    --help -h Display this message and exit.\n");
-    exit(code);
+KSEQ_INIT(gzFile, gzread)
+
+namespace {
+
+void print_help(FILE* stream) {
+    std::fprintf(stream,
+        "Usage: split_read_files (-1 R1 -2 R2 [-3 R3] | -s READS) -o DIR -n N\n"
+        "\n"
+        "Split a single FASTQ or synchronized paired/triplet FASTQs into exactly N\n"
+        "gzip-compressed chunks. Records are assigned round-robin, so corresponding\n"
+        "records from paired or triplet inputs always go to the same chunk. A chunk\n"
+        "can be empty when N is greater than the number of records.\n"
+        "\n"
+        "Input mode (choose exactly one):\n"
+        "  -1, --r1 FILE                 Forward paired-read FASTQ\n"
+        "  -2, --r2 FILE                 Reverse paired-read FASTQ\n"
+        "  -3, --r3 FILE                 Optional third FASTQ synchronized to R1/R2\n"
+        "  -s, --single FILE             Unpaired FASTQ\n"
+        "\n"
+        "Required arguments:\n"
+        "  -o, --output_directory DIR   Directory for split FASTQs\n"
+        "  -n, --num_chunks N           Positive number of output chunks per input\n"
+        "\n"
+        "Other options:\n"
+        "  -h, --help                   Display this help and exit\n"
+        "\n"
+        "Inputs may be plain or gzip-compressed. Output files are named\n"
+        "<input-stem>.<1..N>.fastq.gz in DIR.\n");
 }
 
-KSEQ_INIT(gzFile, gzread);
-
-void write_fastq(kseq_t* seq, gzFile& out){
-    int buflen = seq->name.l + 3;
-    if (seq->comment.l > 0){
-        buflen += seq->comment.l + 1;
-    }
-    char buf[buflen];
-    if (seq->comment.l > 0){
-        sprintf(buf, "@%s %s\n", seq->name.s, seq->comment.s);
-    }
-    else{
-        sprintf(buf, "@%s\n", seq->name.s);
-    }
-    gzwrite(out, buf, buflen-1);
-    char buf2[seq->seq.l + 1];
-    sprintf(buf2, "%s\n", seq->seq.s);
-    gzwrite(out, buf2, seq->seq.l + 1);
-    char buf3[3];
-    sprintf(buf3, "+\n");
-    gzwrite(out, buf3, 2);
-    sprintf(buf2, "%s\n", seq->qual.s);
-    gzwrite(out, buf2, seq->qual.l + 1);
+int usage_error(const char* message) {
+    std::fprintf(stderr, "ERROR: %s\n\n", message);
+    print_help(stderr);
+    return 1;
 }
 
-string filename_noext(const string& filename){
-    size_t pos = filename.rfind(".fastq");
-    if (pos == string::npos){
-        pos = filename.rfind(".fq");
+std::string strip_trailing_slashes(std::string path) {
+    while (path.size() > 1 && path[path.size() - 1] == '/') {
+        path.erase(path.size() - 1);
     }
-    if (pos == string::npos){
-        pos = filename.rfind(".gz");
-    }
-    if (pos != string::npos){
-        return filename.substr(0, pos);
-    }
-    return filename;
+    return path;
 }
 
-
-/**
- * Trim the directory off of a full filename path
- */
-string filename_nopath(string& filename){
-    size_t trim_idx = filename.find_last_of("\\/");
-    if (trim_idx != string::npos){
-        return filename.substr(trim_idx + 1, filename.length() - trim_idx - 1);
-    }
-    else{
-        return filename;
-    }
+std::string filename_nopath(const std::string& filename) {
+    const std::string::size_type pos = filename.find_last_of('/');
+    return pos == std::string::npos ? filename : filename.substr(pos + 1);
 }
 
-int main(int argc, char *argv[]) {    
-    
-    /** Define arguments 
-     * http://www.gnu.org/software/libc/manual/html_node/Getopt-Long-Options.html#Getopt-Long-Options
-     * http://www.gnu.org/software/libc/manual/html_node/Getopt-Long-Option-Example.html#Getopt-Long-Option-Example
-     * Fields for each argument: name, has_arg (values: no_argument, required_argument,
-     *     optional_argument)
-     * flag = int value to store flag for the option, or NULL if option is string
-     * val = short name for string option, or NULL
-     */
-     
-    static struct option long_options[] = {
-       {"r1", required_argument, 0, '1'},
-       {"r2", required_argument, 0, '2'},
-       {"r3", required_argument, 0, '3'},
-       {"single", required_argument, 0, 's'},
-       {"output_directory", required_argument, 0, 'o'},
-       {"num_chunks", required_argument, 0, 'n'},
-       {0, 0, 0, 0} 
+bool ends_with(const std::string& value, const std::string& suffix) {
+    return value.size() >= suffix.size() &&
+        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string fastq_stem(const std::string& path) {
+    std::string name = filename_nopath(path);
+    static const char* const suffixes[] = {
+        ".fastq.gz", ".fq.gz", ".fastq", ".fq", ".gz"
     };
-    
-    // Set default values
-    string r1file;
-    string r2file;
-    string r3file;
-    bool has_r1 = false;
-    bool has_r2 = false;
-    bool has_r3 = false;
-    bool has_paired = false;
-    string sfile;
-    bool has_single = false;
-    string output_directory;
-    bool has_output_directory = false;
-    int num_chunks = -1;
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); ++i) {
+        const std::string suffix(suffixes[i]);
+        if (ends_with(name, suffix)) {
+            name.erase(name.size() - suffix.size());
+            break;
+        }
+    }
+    return name;
+}
+
+bool parse_positive_integer(const char* text, int& value) {
+    errno = 0;
+    char* end = NULL;
+    const long parsed = std::strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || parsed <= 0 || parsed > INT_MAX) {
+        return false;
+    }
+    value = static_cast<int>(parsed);
+    return true;
+}
+
+bool ensure_directory(const std::string& path) {
+    if (mkdir(path.c_str(), 0775) != 0 && errno != EEXIST) {
+        std::fprintf(stderr, "ERROR: unable to create output directory %s: %s\n",
+            path.c_str(), std::strerror(errno));
+        return false;
+    }
+
+    struct stat info;
+    if (stat(path.c_str(), &info) != 0) {
+        std::fprintf(stderr, "ERROR: unable to inspect output path %s: %s\n",
+            path.c_str(), std::strerror(errno));
+        return false;
+    }
+    if (!S_ISDIR(info.st_mode)) {
+        std::fprintf(stderr, "ERROR: output path is not a directory: %s\n", path.c_str());
+        return false;
+    }
+    return true;
+}
+
+std::string canonical_path_or_destination(const std::string& path) {
+    char* resolved = realpath(path.c_str(), NULL);
+    if (resolved != NULL) {
+        const std::string result(resolved);
+        std::free(resolved);
+        return result;
+    }
+
+    const std::string::size_type pos = path.find_last_of('/');
+    const std::string parent = pos == std::string::npos
+        ? "."
+        : (pos == 0 ? "/" : path.substr(0, pos));
+    const std::string basename = pos == std::string::npos
+        ? path
+        : path.substr(pos + 1);
+    if (basename.empty()) {
+        return std::string();
+    }
+
+    resolved = realpath(parent.c_str(), NULL);
+    if (resolved == NULL) {
+        return std::string();
+    }
+    std::string result(resolved);
+    std::free(resolved);
+    if (result.empty() || result[result.size() - 1] != '/') {
+        result += '/';
+    }
+    return result + basename;
+}
+
+bool existing_file_identity(const std::string& path, std::pair<dev_t, ino_t>& identity) {
+    struct stat info;
+    if (stat(path.c_str(), &info) != 0) {
+        return false;
+    }
+    identity = std::make_pair(info.st_dev, info.st_ino);
+    return true;
+}
+
+class GzipFile {
+public:
+    GzipFile() : file_(NULL) {}
+
+    ~GzipFile() {
+        if (file_ != NULL) {
+            gzclose(file_);
+        }
+    }
+
+    bool open(const std::string& path, const char* mode) {
+        path_ = path;
+        file_ = gzopen(path.c_str(), mode);
+        return file_ != NULL;
+    }
+
+    gzFile get() const {
+        return file_;
+    }
+
+    const std::string& path() const {
+        return path_;
+    }
+
+    bool close() {
+        if (file_ == NULL) {
+            return true;
+        }
+        const int result = gzclose(file_);
+        file_ = NULL;
+        if (result != Z_OK) {
+            std::fprintf(stderr,
+                "ERROR: unable to finish gzip output %s (zlib code %d)\n",
+                path_.c_str(), result);
+            return false;
+        }
+        return true;
+    }
+
+private:
+    GzipFile(const GzipFile&);
+    GzipFile& operator=(const GzipFile&);
+
+    gzFile file_;
+    std::string path_;
+};
+
+class FastqInput {
+public:
+    FastqInput() : sequence_(NULL) {}
+
+    ~FastqInput() {
+        if (sequence_ != NULL) {
+            kseq_destroy(sequence_);
+        }
+    }
+
+    bool open(const std::string& path) {
+        if (!file_.open(path, "rb")) {
+            return false;
+        }
+        sequence_ = kseq_init(file_.get());
+        return sequence_ != NULL;
+    }
+
+    int read() {
+        return kseq_read(sequence_);
+    }
+
+    bool clean_eof() const {
+        return gzeof(file_.get()) != 0;
+    }
+
+    kseq_t* sequence() const {
+        return sequence_;
+    }
+
+    gzFile file() const {
+        return file_.get();
+    }
+
+    const std::string& path() const {
+        return file_.path();
+    }
+
+private:
+    FastqInput(const FastqInput&);
+    FastqInput& operator=(const FastqInput&);
+
+    GzipFile file_;
+    kseq_t* sequence_;
+};
+
+void report_gzip_error(gzFile file, const std::string& path, const char* action) {
+    int error_code = Z_OK;
+    const char* detail = gzerror(file, &error_code);
+    if (error_code == Z_ERRNO) {
+        detail = std::strerror(errno);
+    }
+    std::fprintf(stderr, "ERROR: unable to %s %s: %s\n",
+        action, path.c_str(), detail == NULL ? "gzip error" : detail);
+}
+
+bool write_gzip(GzipFile& output, const char* data, size_t length) {
+    while (length > 0) {
+        const size_t maximum = std::numeric_limits<unsigned int>::max();
+        const unsigned int chunk = static_cast<unsigned int>(length > maximum ? maximum : length);
+        const int written = gzwrite(output.get(), data, chunk);
+        if (written <= 0) {
+            report_gzip_error(output.get(), output.path(), "write");
+            return false;
+        }
+        data += written;
+        length -= static_cast<size_t>(written);
+    }
+    return true;
+}
+
+bool write_fastq(const kseq_t* sequence, GzipFile& output) {
+    if (sequence->qual.s == NULL || sequence->qual.l != sequence->seq.l) {
+        std::fprintf(stderr,
+            "ERROR: record %s in an input is not a complete FASTQ record\n",
+            sequence->name.s == NULL ? "<unnamed>" : sequence->name.s);
+        return false;
+    }
+
+    return write_gzip(output, "@", 1) &&
+        write_gzip(output, sequence->name.s, sequence->name.l) &&
+        (sequence->comment.l == 0 ||
+            (write_gzip(output, " ", 1) &&
+             write_gzip(output, sequence->comment.s, sequence->comment.l))) &&
+        write_gzip(output, "\n", 1) &&
+        write_gzip(output, sequence->seq.s, sequence->seq.l) &&
+        write_gzip(output, "\n+\n", 3) &&
+        write_gzip(output, sequence->qual.s, sequence->qual.l) &&
+        write_gzip(output, "\n", 1);
+}
+
+void report_read_error(const FastqInput& input, int result) {
+    if (result == -2) {
+        std::fprintf(stderr, "ERROR: truncated FASTQ quality string in %s\n",
+            input.path().c_str());
+        return;
+    }
+
+    int error_code = Z_OK;
+    const char* detail = gzerror(input.file(), &error_code);
+    if (error_code == Z_ERRNO) {
+        detail = std::strerror(errno);
+    }
+    if (error_code != Z_OK && error_code != Z_STREAM_END) {
+        std::fprintf(stderr, "ERROR: unable to read %s: %s\n",
+            input.path().c_str(), detail == NULL ? "gzip error" : detail);
+    } else {
+        std::fprintf(stderr, "ERROR: malformed FASTQ record in %s (reader code %d)\n",
+            input.path().c_str(), result);
+    }
+}
+
+std::string output_path(const std::string& directory,
+                        const std::string& stem,
+                        int chunk_number) {
+    std::ostringstream path;
+    path << directory;
+    if (directory != "/") {
+        path << '/';
+    }
+    path << stem << '.' << chunk_number << ".fastq.gz";
+    return path.str();
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    static const struct option long_options[] = {
+        {"r1", required_argument, NULL, '1'},
+        {"r2", required_argument, NULL, '2'},
+        {"r3", required_argument, NULL, '3'},
+        {"single", required_argument, NULL, 's'},
+        {"output_directory", required_argument, NULL, 'o'},
+        {"num_chunks", required_argument, NULL, 'n'},
+        {"help", no_argument, NULL, 'h'},
+        {NULL, 0, NULL, 0}
+    };
+
+    std::string r1_path;
+    std::string r2_path;
+    std::string r3_path;
+    std::string single_path;
+    std::string output_directory;
+    int number_of_chunks = 0;
+    bool chunks_set = false;
+
+    if (argc == 1) {
+        print_help(stdout);
+        return 0;
+    }
 
     int option_index = 0;
-    int ch;
-    
-    if (argc == 1){
-        help(0);
-    }
-    while((ch = getopt_long(argc, argv, "1:2:3:s:o:n:h", long_options, &option_index )) != -1){
-        switch(ch){
-            case 0:
-                // This option set a flag. No need to do anything here.
-                break;
-            case 'h':
-                help(0);
-                break;
-            case '1':
-                r1file = optarg;
-                has_r1 = true;
-                break;
-            case '2':
-                r2file = optarg;
-                has_r2 = true;
-                break;
-            case '3':
-                r3file = optarg;
-                has_r3 = true;
-                break;
-            case 's':
-                sfile = optarg;
-                has_single = true;
-                break;
-            case 'o':
-                output_directory = optarg;
-                has_output_directory = true;
-                break;
+    int option = 0;
+    while ((option = getopt_long(argc, argv, "1:2:3:s:o:n:h", long_options,
+                                  &option_index)) != -1) {
+        switch (option) {
+            case '1': r1_path = optarg; break;
+            case '2': r2_path = optarg; break;
+            case '3': r3_path = optarg; break;
+            case 's': single_path = optarg; break;
+            case 'o': output_directory = optarg; break;
             case 'n':
-                num_chunks = atoi(optarg);
+                chunks_set = parse_positive_integer(optarg, number_of_chunks);
+                if (!chunks_set) {
+                    return usage_error("--num_chunks / -n must be a positive integer");
+                }
                 break;
-            default:
-                help(0);
+            case 'h': print_help(stdout); return 0;
+            default: return 1;
+        }
+    }
+
+    if (optind != argc) {
+        return usage_error("unexpected positional argument");
+    }
+    if (!chunks_set) {
+        return usage_error("--num_chunks / -n is required");
+    }
+    if (output_directory.empty()) {
+        return usage_error("--output_directory / -o is required");
+    }
+
+    const bool any_paired_input = !r1_path.empty() || !r2_path.empty() || !r3_path.empty();
+    if (!single_path.empty() && any_paired_input) {
+        return usage_error("--single cannot be combined with --r1, --r2, or --r3");
+    }
+    if (single_path.empty() && (r1_path.empty() || r2_path.empty())) {
+        return usage_error("provide either --single, or both --r1 and --r2");
+    }
+    if (!r3_path.empty() && (r1_path.empty() || r2_path.empty())) {
+        return usage_error("--r3 requires both --r1 and --r2");
+    }
+
+    std::vector<std::string> input_paths;
+    if (!single_path.empty()) {
+        input_paths.push_back(single_path);
+    } else {
+        input_paths.push_back(r1_path);
+        input_paths.push_back(r2_path);
+        if (!r3_path.empty()) {
+            input_paths.push_back(r3_path);
+        }
+    }
+
+    output_directory = strip_trailing_slashes(output_directory);
+    if (!ensure_directory(output_directory)) {
+        return 1;
+    }
+
+    std::vector<std::string> stems;
+    for (size_t i = 0; i < input_paths.size(); ++i) {
+        const std::string stem = fastq_stem(input_paths[i]);
+        if (stem.empty()) {
+            std::fprintf(stderr, "ERROR: unable to derive an output stem from %s\n",
+                input_paths[i].c_str());
+            return 1;
+        }
+        stems.push_back(stem);
+    }
+
+    std::vector<std::unique_ptr<FastqInput> > inputs;
+    for (size_t i = 0; i < input_paths.size(); ++i) {
+        std::unique_ptr<FastqInput> input(new FastqInput());
+        if (!input->open(input_paths[i])) {
+            std::fprintf(stderr, "ERROR: unable to open %s for reading: %s\n",
+                input_paths[i].c_str(), std::strerror(errno));
+            return 1;
+        }
+        inputs.push_back(std::move(input));
+    }
+
+    std::set<std::string> canonical_inputs;
+    std::set<std::pair<dev_t, ino_t> > input_identities;
+    for (size_t i = 0; i < input_paths.size(); ++i) {
+        const std::string canonical = canonical_path_or_destination(input_paths[i]);
+        std::pair<dev_t, ino_t> identity;
+        const bool duplicate_path = !canonical.empty() && !canonical_inputs.insert(canonical).second;
+        const bool duplicate_file = existing_file_identity(input_paths[i], identity) &&
+            !input_identities.insert(identity).second;
+        if (duplicate_path || duplicate_file) {
+            std::fprintf(stderr, "ERROR: input paths resolve to the same file: %s\n",
+                input_paths[i].c_str());
+            return 1;
+        }
+    }
+
+    std::vector<std::string> output_paths;
+    std::set<std::string> canonical_outputs;
+    std::set<std::pair<dev_t, ino_t> > output_identities;
+    for (int chunk = 1; chunk <= number_of_chunks; ++chunk) {
+        for (size_t stream = 0; stream < stems.size(); ++stream) {
+            const std::string path = output_path(output_directory, stems[stream], chunk);
+            const std::string canonical = canonical_path_or_destination(path);
+            if (canonical.empty()) {
+                std::fprintf(stderr, "ERROR: unable to resolve output destination %s\n",
+                    path.c_str());
+                return 1;
+            }
+            if (canonical_inputs.count(canonical) != 0) {
+                std::fprintf(stderr, "ERROR: output %s resolves to an input file\n", path.c_str());
+                return 1;
+            }
+            if (!canonical_outputs.insert(canonical).second) {
+                std::fprintf(stderr, "ERROR: multiple chunks would use output path %s\n",
+                    path.c_str());
+                return 1;
+            }
+
+            std::pair<dev_t, ino_t> identity;
+            if (existing_file_identity(path, identity)) {
+                if (input_identities.count(identity) != 0) {
+                    std::fprintf(stderr, "ERROR: output %s is a hard link to an input file\n",
+                        path.c_str());
+                    return 1;
+                }
+                if (!output_identities.insert(identity).second) {
+                    std::fprintf(stderr,
+                        "ERROR: multiple output paths refer to the same existing file: %s\n",
+                        path.c_str());
+                    return 1;
+                }
+            }
+            output_paths.push_back(path);
+        }
+    }
+
+    std::vector<std::unique_ptr<GzipFile> > outputs;
+    for (size_t i = 0; i < output_paths.size(); ++i) {
+        std::unique_ptr<GzipFile> output(new GzipFile());
+        if (!output->open(output_paths[i], "wb")) {
+            std::fprintf(stderr, "ERROR: unable to open %s for writing: %s\n",
+                output_paths[i].c_str(), std::strerror(errno));
+            return 1;
+        }
+        outputs.push_back(std::move(output));
+    }
+
+    bool processing_ok = true;
+    size_t record_number = 0;
+    int chunk_index = 0;
+
+    while (processing_ok) {
+        const int first_result = inputs[0]->read();
+        if (first_result < 0) {
+            if (first_result != -1 || !inputs[0]->clean_eof()) {
+                report_read_error(*inputs[0], first_result);
+                processing_ok = false;
+            } else {
+                for (size_t stream = 1; stream < inputs.size(); ++stream) {
+                    const int extra_result = inputs[stream]->read();
+                    if (extra_result >= 0) {
+                        std::fprintf(stderr,
+                            "ERROR: %s contains more records than %s\n",
+                            inputs[stream]->path().c_str(), inputs[0]->path().c_str());
+                        processing_ok = false;
+                    } else if (extra_result != -1 || !inputs[stream]->clean_eof()) {
+                        report_read_error(*inputs[stream], extra_result);
+                        processing_ok = false;
+                    }
+                }
+            }
+            break;
+        }
+
+        for (size_t stream = 1; stream < inputs.size(); ++stream) {
+            const int result = inputs[stream]->read();
+            if (result < 0) {
+                if (result != -1 || !inputs[stream]->clean_eof()) {
+                    report_read_error(*inputs[stream], result);
+                } else {
+                    std::fprintf(stderr,
+                        "ERROR: %s ended before %s at record %zu\n",
+                        inputs[stream]->path().c_str(), inputs[0]->path().c_str(),
+                        record_number + 1);
+                }
+                processing_ok = false;
                 break;
-        }    
-    }
-    
-    // Error check arguments.
-    has_paired = has_r1 && has_r2;
-    if (!has_paired && !has_single){
-        fprintf(stderr, "ERROR: at least one of either -1 and -2 or -s must be provided.\n");
-        exit(1);
-    }
-    if (has_r3 && (!has_r1 || !has_r2)){
-        fprintf(stderr, "ERROR: cannot process R3 without corresponding R1 and R2\n");
-        exit(1);
-    }
-    if (num_chunks <= 0){
-        fprintf(stderr, "ERROR: num chunks must be a positive integer\n");
-        exit(1);
-    }    
-    
-    if (!has_output_directory){
-        fprintf(stderr, "ERROR: output_directory / -o required\n");
-        exit(1);
-    }
-    
-    if (output_directory[output_directory.size()-1] == '/'){
-        output_directory = output_directory.substr(0, output_directory.length()-1);
-    }
-
-    if (!mkdir(output_directory.c_str(), 0775)){
-        // Assume directory already exists
-    }
-    
-    // Define output files
-    gzFile outfiles[num_chunks*3 + 1];
-    
-    string base1;
-    string base2;
-    string base3;
-    string base_single;
-    
-    if (has_paired){
-        base1 = filename_nopath(r1file);
-        base1 = filename_noext(base1);
-        base2 = filename_nopath(r2file);
-        base2 = filename_noext(base2);
-        if (has_r3){
-            base3 = filename_nopath(r3file);
-            base3 = filename_noext(base3);
-        }
-    }
-    else{
-        base_single = filename_nopath(sfile);
-        base_single = filename_noext(base_single);
-    }
-
-    for (int i = 0; i < num_chunks; ++i){
-        if (has_paired){
-            char fn1[150];
-            char fn2[150];
-            sprintf(&fn1[0], "%s/%s.%d.fastq.gz", output_directory.c_str(), base1.c_str(), i+1);
-            sprintf(&fn2[0], "%s/%s.%d.fastq.gz", output_directory.c_str(), base2.c_str(), i+1);
-            if (has_r3){
-                char fn3[150];
-                sprintf(&fn3[0], "%s/%s.%d.fastq.gz", output_directory.c_str(), base3.c_str(), i+1);
-                outfiles[i*3] = gzopen(fn1, "w");
-                outfiles[i*3+1] = gzopen(fn2, "w");
-                outfiles[i*3+2] = gzopen(fn3, "w");
-                if (!outfiles[i*3]){
-                    fprintf(stderr, "ERROR opening %s for writing.\n", fn1);
-                    exit(1);
-                }
-                if (!outfiles[i*3+1]){
-                    fprintf(stderr, "ERROR opening %s for writing.\n", fn2);
-                    exit(1);
-                }
-                if (!outfiles[i*3+2]){
-                    fprintf(stderr, "ERROR opening %s for writing.\n", fn3);
-                    exit(1);
-                }
-            }
-            else{
-                outfiles[i*2] = gzopen(fn1, "w");
-                outfiles[i*2+1] = gzopen(fn2, "w");
-                if (!outfiles[i*2]){
-                    fprintf(stderr, "ERROR opening %s for writing.\n", fn1);
-                    exit(1);
-                }
-                if (!outfiles[i*2+1]){
-                    fprintf(stderr, "ERROR opening %s for writing.\n", fn2);
-                    exit(1);
-                }
             }
         }
-        else{
-            char fn[150];
-            sprintf(&fn[0], "%s/%s.%d.fastq.gz", output_directory.c_str(), base_single.c_str(),
-                i+1);
-            outfiles[i*2] = gzopen(fn, "w");
-            if (!outfiles[i*2]){
-                fprintf(stderr, "ERROR opening %s for writing.\n", fn);
-                exit(1);
+        if (!processing_ok) {
+            break;
+        }
+
+        for (size_t stream = 0; stream < inputs.size(); ++stream) {
+            const size_t output_index = static_cast<size_t>(chunk_index) * inputs.size() + stream;
+            if (!write_fastq(inputs[stream]->sequence(), *outputs[output_index])) {
+                processing_ok = false;
+                break;
             }
+        }
+        if (!processing_ok) {
+            break;
+        }
+
+        ++record_number;
+        chunk_index = (chunk_index + 1) % number_of_chunks;
+    }
+
+    bool close_ok = true;
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        if (!outputs[i]->close()) {
+            close_ok = false;
         }
     }
 
-    // Prep input file(s).
-    int f_progress;
-    int r_progress;
-    int f3_progress;
-    gzFile f_fp;
-    gzFile r_fp;
-    gzFile r3_fp;
-    gzFile s_fp;
-    kseq_t* seq_f;
-    kseq_t* seq_r;
-    kseq_t* seq_r3;
-    if (has_paired){
-        f_fp = gzopen(r1file.c_str(), "r");
-        if (!f_fp){
-            fprintf(stderr, "ERROR opening %s for reading\n", r1file.c_str());
-            exit(1);
-        }    
-        r_fp = gzopen(r2file.c_str(), "r");
-        if (!r_fp){
-            fprintf(stderr, "ERROR opening %s for reading\n", r2file.c_str());
-            exit(1);
-        }
-        seq_f = kseq_init(f_fp);
-        seq_r = kseq_init(r_fp);
-        if (has_r3){
-            r3_fp = gzopen(r3file.c_str(), "r");
-            if (!r3_fp){
-                fprintf(stderr, "ERROR opening %s for reading\n", r3file.c_str());
-                exit(1);
-            }
-            seq_r3 = kseq_init(r3_fp);
-        }
-    }
-
-    else{
-        s_fp = gzopen(sfile.c_str(), "r");
-        if (!s_fp){
-            fprintf(stderr, "ERROR opening %s for reading\n", sfile.c_str());
-            exit(1);
-        }
-        seq_f = kseq_init(s_fp);
-    }
-    
-    int cur_chunk_idx = 0;
-    while ((f_progress = kseq_read(seq_f)) >= 0){
-        
-        if (has_r3){
-            write_fastq(seq_f, outfiles[cur_chunk_idx*3]);
-        }
-        else{
-            write_fastq(seq_f, outfiles[cur_chunk_idx*2]);
-        }
-
-        if (has_paired){
-            r_progress = kseq_read(seq_r);
-            if (r_progress < 0){
-                fprintf(stderr, "ERROR: read order no longer matching at seq %s in R1 file\n", seq_f->name.s);
-                exit(1);
-            }    
-            if (has_r3){
-                write_fastq(seq_r, outfiles[cur_chunk_idx*3+1]);
-                f3_progress = kseq_read(seq_r3);
-                if (f3_progress < 0){
-                    fprintf(stderr, "ERROR: read order no longer matching at seq %s in R3 file\n", seq_r3->name.s);
-                    exit(1);
-                }
-                write_fastq(seq_r3, outfiles[cur_chunk_idx*3+2]);
-            }
-            else{
-                write_fastq(seq_r, outfiles[cur_chunk_idx*2+1]);
-            }
-        }
-        
-        cur_chunk_idx++;
-
-        if (cur_chunk_idx >= num_chunks){
-            cur_chunk_idx = 0;
-        }
-    }
-
-    kseq_destroy(seq_f);
-
-    // Close output files.
-    if (has_paired){
-        kseq_destroy(seq_r);
-        if (has_r3){
-            kseq_destroy(seq_r3);
-        }
-        for (int i = 0; i < num_chunks; ++i){
-            if (has_r3){
-                gzclose(outfiles[i*3]);
-                gzclose(outfiles[i*3 + 1]);
-                gzclose(outfiles[i*3 + 2]);
-            }
-            else{
-                gzclose(outfiles[i*2]);
-                gzclose(outfiles[i*2 + 1]);
-            }
-        }
-    }
-    else{
-        for (int i = 0; i < num_chunks; ++i){
-            gzclose(outfiles[i*2]);
-        }
-    }    
-    return 0;
+    return processing_ok && close_ok ? 0 : 1;
 }
-

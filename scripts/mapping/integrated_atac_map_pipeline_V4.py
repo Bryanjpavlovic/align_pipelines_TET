@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import glob
+import gzip
 import hashlib
 import json
 import os
@@ -30,10 +31,12 @@ import sys
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
+from contextlib import ExitStack
+from itertools import zip_longest
 import re
 
 
-RELEASE = "2026-08-30-v9-align-repo-migration"
+RELEASE = "2026-09-26-v10-mixed-atac-layouts"
 ALIGN_PIPELINES_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ATAC_WORKFLOW = str(ALIGN_PIPELINES_ROOT / "workflows" / "align_atac.nf")
 DEFAULT_ATAC_LIB_PREFIX = "Tet_2025_Multiome-ATAC_"
@@ -52,21 +55,35 @@ def get_file_size(filepath):
 
 
 def find_fastq_triplets(input_dir):
-    """Find all R1/R2/R3 FASTQ file triplets in the input directory."""
-    r3_patterns = [
-        os.path.join(input_dir, "*_R3_*.fastq.gz"),
-        os.path.join(input_dir, "*_R3_*.fq.gz"),
-    ]
-    
+    """Return (genomic R1, barcode read, genomic mate 2) for each raw set.
+
+    Detect legacy R1/R2/R3 and current R1/I2/R2 layouts independently for
+    each filename stem. I1 is the sample index and is not needed for mapping.
+    Read length does not determine layout: PE50 and PE151 sets can coexist.
+    """
     triplets = []
-    for pattern in r3_patterns:
-        for r3_file in glob.glob(pattern):
-            r1_file = r3_file.replace('_R3_', '_R1_')
-            r2_file = r3_file.replace('_R3_', '_R2_')
-            if os.path.exists(r1_file) and os.path.exists(r2_file):
-                triplets.append((r1_file, r2_file, r3_file))
-    
-    return sorted(list(set(triplets)))
+    for suffix in ("fastq.gz", "fq.gz"):
+        for r1_file in glob.glob(os.path.join(input_dir, f"*_R1_*.{suffix}")):
+            stem, tail = os.path.basename(r1_file).rsplit('_R1_', 1)
+            mates = {
+                role: os.path.join(input_dir, f"{stem}_{role}_{tail}")
+                for role in ('R2', 'R3', 'I2')
+            }
+            if not os.path.isfile(mates['R2']):
+                continue
+            has_r3 = os.path.isfile(mates['R3'])
+            has_i2 = os.path.isfile(mates['I2'])
+            if has_r3 and has_i2:
+                raise ValueError(
+                    f"Ambiguous ATAC FASTQ set: {r1_file} has both R3 and I2. "
+                    "The shared R2 cannot be assigned both barcode and genomic roles; "
+                    "keep the separate exports in their original input directories."
+                )
+            if has_r3:
+                triplets.append((r1_file, mates['R2'], mates['R3']))
+            elif has_i2:
+                triplets.append((r1_file, mates['I2'], mates['R2']))
+    return sorted(set(triplets))
 
 
 def extract_library_name(fastq_file, prefix=DEFAULT_ATAC_LIB_PREFIX):
@@ -76,7 +93,7 @@ def extract_library_name(fastq_file, prefix=DEFAULT_ATAC_LIB_PREFIX):
     if match:
         candidate = match.group(1)
     else:
-        candidate = re.sub(r'_R[123]_.*', '', basename)
+        candidate = re.sub(r'_(?:R[123]|I2)_.*', '', basename)
     if prefix:
         prefixed = re.match(rf'({re.escape(prefix)}\d+)(?:_|$)', candidate)
         if prefixed:
@@ -86,20 +103,18 @@ def extract_library_name(fastq_file, prefix=DEFAULT_ATAC_LIB_PREFIX):
 
 def insert_run_tag(basename, run_tag):
     """
-    Insert __RunTag between _S##_L## and _R#_ parts of a FASTQ filename.
+    Insert __RunTag before the R1, R2, R3, or I2 read-role token.
     
     Tet_2025_Multiome-ATAC_3_S3_L002_R3_001.fastq.gz
     -> Tet_2025_Multiome-ATAC_3_S3_L002__Run001_R3_001.fastq.gz
     
-    The NF regex captures everything before _R3 as match[2], so match[2]
-    will be: Tet_2025_Multiome-ATAC_3_S3_L002__Run001
-    Then strip_run_tag removes __Run001 to get the original prefix back.
+    All biological reads in a set retain the same run-tagged filename stem.
     """
-    m = re.match(r'^(.+_S\d+_L\d+)(_R[123]_.+)$', basename)
+    m = re.match(r'^(.+_S\d+_L\d+)(_(?:R[123]|I2)_.+)$', basename)
     if m:
         return f"{m.group(1)}__{run_tag}{m.group(2)}"
-    # Fallback: insert before _R#_
-    m = re.match(r'^(.+?)(_R[123]_.+)$', basename)
+    # Fallback: insert before the read-role token.
+    m = re.match(r'^(.+?)(_(?:R[123]|I2)_.+)$', basename)
     if m:
         return f"{m.group(1)}__{run_tag}{m.group(2)}"
     # Last resort
@@ -155,6 +170,107 @@ def library_nums_to_names(lib_nums, prefix=DEFAULT_ATAC_LIB_PREFIX):
     return {f"{prefix}{n}" for n in lib_nums}
 
 
+def cluster_name(header):
+    """Illumina cluster identity, independent of export read numbering."""
+    return re.sub(br'/[1234]$', b'', header.split()[0].lstrip(b'@'))
+
+
+def export_records(entries):
+    """Stream synchronized biological read roles across an export's chunks."""
+    def chunk_key(entry):
+        match = re.search(r'_R1_(\d+)\.', os.path.basename(entry[1]))
+        return (int(match.group(1)) if match else 0, entry[1])
+
+    for _, r1, barcode, mate2 in sorted(entries, key=chunk_key):
+        with ExitStack() as stack:
+            handles = [stack.enter_context(gzip.open(path, 'rb'))
+                       for path in (r1, barcode, mate2)]
+            while True:
+                records = [[handle.readline() for _ in range(4)] for handle in handles]
+                if not any(record[0] for record in records):
+                    break
+                if any(not record[0].startswith(b'@') or not record[2].startswith(b'+')
+                       or not record[1].strip()
+                       or len(record[1].rstrip()) != len(record[3].rstrip())
+                       for record in records):
+                    raise ValueError(f"Incomplete FASTQ record while comparing exports: {r1}")
+                names = [cluster_name(record[0]) for record in records]
+                if len(set(names)) != 1:
+                    raise ValueError(f"Unsynchronized ATAC export: {r1}")
+                yield (names[0], records[0][1].rstrip(),
+                       records[1][1].rstrip()[-16:], records[2][1].rstrip())
+
+
+def preferred_export(left, right):
+    """Choose a complete equal/longer reexport, never a partial replacement."""
+    left_extends = right_extends = True
+    count = 0
+    with ExitStack() as stack:
+        left_records = export_records(left)
+        right_records = export_records(right)
+        stack.callback(left_records.close)
+        stack.callback(right_records.close)
+        for a, b in zip_longest(left_records, right_records):
+            if a is None or b is None or a[0] != b[0] or a[2] != b[2]:
+                raise ValueError(
+                    "Potentially overlapping ATAC exports have different cluster membership, "
+                    "order, or cell barcodes: " + left[0][1] + " and " + right[0][1] +
+                    ". Supply one complete export for this sequencing unit; "
+                    "partial or reordered replacements cannot be combined automatically."
+                )
+            left_extends &= a[1].startswith(b[1]) and a[3].startswith(b[3])
+            right_extends &= b[1].startswith(a[1]) and b[3].startswith(a[3])
+            count += 1
+    if not count or not (left_extends or right_extends):
+        raise ValueError(
+            "ATAC reexports do not provide one consistent equal/longer genomic pair: "
+            + left[0][1] + " and " + right[0][1]
+        )
+    # Equal reads need only one copy; prefer the I2 export when both are equivalent.
+    if right_extends and (not left_extends or '_I2_' in os.path.basename(right[0][2])):
+        return right
+    return left
+
+
+def select_sequencing_exports(entries):
+    """Retain independent runs and replace verified duplicate exports only.
+
+    Full scans occur only for overlapping exports, during the compute job's
+    consolidation. Folder names, sample numbers and PE length alone never
+    decide whether an independent PE50 dataset is discarded.
+    """
+    groups = defaultdict(lambda: defaultdict(list))
+    seen_sources = set()
+    for entry in entries:
+        folder, r1, barcode, mate2 = entry
+        sources = tuple(os.path.realpath(path) for path in (r1, barcode, mate2))
+        if sources in seen_sources:
+            continue
+        seen_sources.add(sources)
+        with gzip.open(r1, 'rb') as handle:
+            header = handle.readline()
+        fields = cluster_name(header).split(b':') if header.startswith(b'@') else []
+        # Non-Illumina names cannot establish cross-export identity.
+        unit = tuple(fields[:4]) if len(fields) >= 7 else sources
+        layout = 'I2' if '_I2_' in os.path.basename(barcode) else 'R3'
+        stem = os.path.basename(r1).rsplit('_R1_', 1)[0]
+        groups[unit][(os.path.realpath(folder), layout, stem)].append(entry)
+
+    selected = []
+    for exports in groups.values():
+        candidates = list(exports.values())
+        best = candidates[0]
+        for candidate in candidates[1:]:
+            print(f"    Comparing overlapping exports: {best[0][1]} and {candidate[0][1]}")
+            chosen = preferred_export(best, candidate)
+            omitted = candidate if chosen is best else best
+            print(f"    Using {chosen[0][1]}; equivalent shorter/equal export omitted: {omitted[0][1]}")
+            best = chosen
+        selected.extend(best)
+    selected_set = set(selected)
+    return list(dict.fromkeys(entry for entry in entries if entry in selected_set))
+
+
 # ============================================================================
 # CONSOLIDATION
 # ============================================================================
@@ -181,7 +297,7 @@ def consolidate_inputs(input_dirs, consolidated_dir, project_dir,
     # Sort input dirs by age (oldest first), name as tiebreaker
     sorted_dirs = sorted(input_dirs, key=get_folder_sort_key)
     
-    # lib_name -> [(folder_path, r1, r2, r3), ...]
+    # lib_name -> [(folder_path, genomic_r1, barcode, genomic_r2), ...]
     lib_folder_triplets = defaultdict(list)
     
     for input_dir in sorted_dirs:
@@ -207,6 +323,9 @@ def consolidate_inputs(input_dirs, consolidated_dir, project_dir,
     if not lib_folder_triplets:
         print("  ERROR: No libraries found to consolidate!")
         sys.exit(1)
+
+    for lib_name, entries in lib_folder_triplets.items():
+        lib_folder_triplets[lib_name] = select_sequencing_exports(entries)
     
     # -------------------------------------------------------------------------
     # Step 2: Assign per-library run numbers
@@ -257,15 +376,12 @@ def consolidate_inputs(input_dirs, consolidated_dir, project_dir,
             flowcell, lane_num = extract_flowcell_lane(r1)
             sample_idx, lane_id = extract_sample_lane(os.path.basename(r1))
             
-            # Determine fnbase from the R3 symlink name (what NF will see as match[2])
-            r3_orig_base = os.path.basename(r3)
-            r3_new_base = insert_run_tag(r3_orig_base, run_tag)
-            # fnbase = everything before _R3 in the symlink name
-            fnbase_match = re.match(r'^(.+?)_R3', r3_new_base)
-            if fnbase_match:
-                fnbase = fnbase_match.group(1)
-            else:
-                fnbase = r3_new_base
+            # R1 identifies the common stem for both raw read layouts.
+            r1_new_base = insert_run_tag(os.path.basename(r1), run_tag)
+            fnbase = r1_new_base.rsplit('_R1_', 1)[0]
+            source_chunk = r1_new_base.rsplit('_R1_', 1)[1].split('.', 1)[0]
+            if source_chunk != '001':
+                fnbase += f"__Part{source_chunk}"
             
             # Build the full RG string that NF will use in minimap2 -R
             # Single \t in the file — Groovy interpolation doesn't re-escape,
@@ -323,7 +439,8 @@ def consolidate_inputs(input_dirs, consolidated_dir, project_dir,
     # Step 4: Reject stale inputs and verify counts
     # -------------------------------------------------------------------------
     unexpected_existing = sorted(
-        path for path in glob.glob(os.path.join(consolidated_dir, '*.fastq.gz'))
+        path for suffix in ('fastq.gz', 'fq.gz')
+        for path in glob.glob(os.path.join(consolidated_dir, f'*.{suffix}'))
         if os.path.basename(path) not in symlink_registry
     )
     if unexpected_existing:
@@ -333,20 +450,20 @@ def consolidate_inputs(input_dirs, consolidated_dir, project_dir,
         print("     Refusing to mix staged runs; use a new orchestrator --run-name.")
         sys.exit(1)
 
-    num_r1 = len(glob.glob(os.path.join(consolidated_dir, '*_R1_*.fastq.gz')))
-    num_r2 = len(glob.glob(os.path.join(consolidated_dir, '*_R2_*.fastq.gz')))
-    num_r3 = len(glob.glob(os.path.join(consolidated_dir, '*_R3_*.fastq.gz')))
+    staged_triplets = find_fastq_triplets(consolidated_dir)
+    num_legacy = sum('_R3_' in os.path.basename(mate2)
+                     for _, _, mate2 in staged_triplets)
+    num_current = len(staged_triplets) - num_legacy
     
     print(f"\n  Consolidation summary:")
     print(f"    Libraries:      {len(lib_folder_triplets)}")
     print(f"    Total triplets: {total_triplets}")
-    print(f"    R1 files:       {num_r1}")
-    print(f"    R2 files:       {num_r2}")
-    print(f"    R3 files:       {num_r3}")
+    print(f"    R1/R2/R3 sets:  {num_legacy}")
+    print(f"    R1/I2/R2 sets:  {num_current}")
     print(f"    Total symlinks: {len(symlink_registry)}")
     
-    if num_r1 != num_r3 or num_r2 != num_r3:
-        print("    ERROR: Mismatch between R1, R2, and R3 file counts!")
+    if len(staged_triplets) != total_triplets or len(symlink_registry) != 3 * total_triplets:
+        print("    ERROR: Staged biological read sets do not match the selected inputs!")
         sys.exit(1)
     
     # -------------------------------------------------------------------------
@@ -492,21 +609,7 @@ if [ $CONSOLIDATE_EXIT -ne 0 ]; then
     exit $CONSOLIDATE_EXIT
 fi
 
-NUM_R1=$(ls -1 {consolidated_dir}/*_R1_*.fastq.gz 2>/dev/null | wc -l)
-NUM_R2=$(ls -1 {consolidated_dir}/*_R2_*.fastq.gz 2>/dev/null | wc -l)
-NUM_R3=$(ls -1 {consolidated_dir}/*_R3_*.fastq.gz 2>/dev/null | wc -l)
-
-echo ""
-echo "R1: $NUM_R1 | R2: $NUM_R2 | R3: $NUM_R3"
-
-if [ $NUM_R1 -eq 0 ] || [ $NUM_R2 -eq 0 ] || [ $NUM_R3 -eq 0 ]; then
-    echo "ERROR: Missing ATAC-seq triplet files!"
-    exit 1
-fi
-if [ $NUM_R1 -ne $NUM_R3 ] || [ $NUM_R2 -ne $NUM_R3 ]; then
-    echo "ERROR: Mismatch between R1, R2, and R3 file counts!"
-    exit 1
-fi
+# Consolidation validated complete biological read sets in both naming layouts.
 
 echo ""
 

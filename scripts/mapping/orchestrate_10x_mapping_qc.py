@@ -101,7 +101,9 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-RELEASE = "2026-09-15-v25-central-figures-flexible-run-dir"
+RELEASE = "2026-09-26-v28-mixed-atac-layouts"
+
+DEFAULT_RNA_SPLICING_PYTHON = "/nvme/software/envs/genomics-base/bin/python"
 
 DEFAULT_RNA3_RAW_ROOT = "/mnt/beegfs/reads/3P_Multiome_10XRNA"
 DEFAULT_ATAC_RAW_ROOT = "/mnt/beegfs/reads/10X_ATAC_multiome"
@@ -191,6 +193,7 @@ class Resources:
     bam_evidence_runner: Path | None
     bam_evidence_profiler: Path | None
     star_diagnostic_promoter: Path | None
+    rna_splicing_runner: Path | None = None
 
 
 @dataclass
@@ -442,6 +445,9 @@ def resolve_resources(args: argparse.Namespace) -> Resources:
             ("promote_rna_star_diagnostics.py",),
             ("promote_rna_star_diagnostics.py",),
         ),
+        rna_splicing_runner=find_resource(
+            None, root, ("run_rna_splicing.py",), ("run_rna_splicing.py",)
+        ),
     )
 
 
@@ -456,14 +462,10 @@ def fastq_pairs(run: Path) -> list[tuple[Path, Path]]:
 
 
 def fastq_triplets(run: Path) -> list[tuple[Path, Path, Path]]:
-    triplets: set[tuple[Path, Path, Path]] = set()
-    for pattern in ("*_R1_*.fastq.gz", "*_R1_*.fq.gz"):
-        for r1 in run.glob(pattern):
-            r2 = Path(str(r1).replace("_R1_", "_R2_"))
-            r3 = Path(str(r1).replace("_R1_", "_R3_"))
-            if r2.is_file() and r3.is_file():
-                triplets.add((r1, r2, r3))
-    return sorted(triplets)
+    """Return genomic R1, barcode R2/I2, genomic R3/R2 in biological order."""
+    from integrated_atac_map_pipeline_V4 import find_fastq_triplets
+
+    return [tuple(Path(path) for path in unit) for unit in find_fastq_triplets(run)]
 
 
 def library_from_fastq(path: Path, prefix: str | None = None) -> str:
@@ -547,9 +549,13 @@ def discover(
             if not run.is_dir():
                 failures.append(f"{modality}: input directory does not exist: {run}")
                 continue
-            all_units = fastq_triplets(run) if is_atac else fastq_pairs(run)
+            try:
+                all_units = fastq_triplets(run) if is_atac else fastq_pairs(run)
+            except ValueError as exc:
+                failures.append(f"{modality}: {exc}")
+                continue
             if not all_units:
-                kind = "R1/R2/R3 triplets" if is_atac else "R1/R2 pairs"
+                kind = "R1/R2/R3 or R1/I2/R2 sets" if is_atac else "R1/R2 pairs"
                 failures.append(f"{modality}: no complete {kind} found in {run}")
                 continue
             units = [
@@ -581,16 +587,22 @@ def discover(
                 except OSError as exc:
                     failures.append(f"{modality}: could not stat FASTQ {fastq}: {exc}")
             try:
-                r1_length = first_sequence_length(units[0][0])
-                r2_length = first_sequence_length(units[0][1])
-                record: dict[str, object] = {
-                    "run": str(run),
-                    "r1": r1_length,
-                    "r2": r2_length,
-                }
                 if is_atac:
-                    record["r3"] = first_sequence_length(units[0][2])
-                lengths.append(record)
+                    for r1, barcode, genomic2 in units:
+                        modern = "_I2_" in barcode.name
+                        lengths.append({
+                            "run": str(run), "fastq": r1.name,
+                            "layout": "R1/I2/R2" if modern else "R1/R2/R3",
+                            "r1": first_sequence_length(r1),
+                            "i2" if modern else "r2": first_sequence_length(barcode),
+                            "r2" if modern else "r3": first_sequence_length(genomic2),
+                        })
+                else:
+                    lengths.append({
+                        "run": str(run),
+                        "r1": first_sequence_length(units[0][0]),
+                        "r2": first_sequence_length(units[0][1]),
+                    })
                 if modality == "rna5":
                     unit_formats: set[str] = set()
                     for unit in units:
@@ -731,6 +743,14 @@ def resource_failures(
                 args.rna3_bam_evidence_class_manifest,
             )
 
+    if args.rna_splicing:
+        require_file("RNA splicing runner", resources.rna_splicing_runner)
+        require_path("RNA splicing annotation", args.rna_splicing_gtf)
+        if args.rna_splicing_python:
+            require_path("RNA splicing Python interpreter", args.rna_splicing_python)
+            if not os.access(args.rna_splicing_python, os.X_OK):
+                failures.append("RNA splicing Python interpreter is not executable")
+
     if args.submit and shutil.which("sbatch") is None:
         failures.append("--submit was requested but sbatch is not available in PATH")
     return failures
@@ -778,6 +798,10 @@ def print_diagnosis(
             detail = f"R1={record['r1']} R2={record['r2']}"
             if "r3" in record:
                 detail += f" R3={record['r3']}"
+            if "i2" in record:
+                detail += f" I2={record['i2']}"
+            if "layout" in record:
+                detail += f" layout={record['layout']} ({record['fastq']})"
             if modality == "rna5":
                 detail += f" format={discovery.rna5_formats.get(str(record['run']))}"
             print(f"  {Path(str(record['run'])).name}: {detail}")
@@ -877,6 +901,10 @@ def config_payload(
             else None
         ),
         "reporting": {
+            "rna_splicing": args.rna_splicing,
+            "rna_splicing_gtf": args.rna_splicing_gtf,
+            "rna_splicing_raw": args.rna_splicing_raw,
+            "rna_splicing_python": args.rna_splicing_python,
             "rna3_figure_root": args.rna3_figure_root,
             "rna5_figure_root": args.rna5_figure_root,
             "atac_figure_root": args.atac_figure_root,
@@ -2497,6 +2525,79 @@ test -x {q(resources.bam_evidence_profiler)}
     ]
 
 
+def rna_splicing_output_names(include_raw: bool = False) -> list[str]:
+    names = ["splicing/splicing.h5ad", "splicing/counts_summary.json"]
+    for directory in (["splicing_filtered", "splicing_raw"] if include_raw else ["splicing_filtered"]):
+        names.extend(
+            f"{directory}/{name}"
+            for name in ("spliced.mtx.gz", "unspliced.mtx.gz", "ambiguous.mtx.gz",
+                         "features.tsv.gz", "barcodes.tsv.gz")
+        )
+    return names
+
+
+def generate_rna_splicing_job(
+    label: str,
+    libraries: Sequence[str],
+    root: Path,
+    run_dir: Path,
+    args: argparse.Namespace,
+    resources: Resources,
+    dependencies: Sequence[str],
+) -> JobSpec:
+    """Count spliced/unspliced molecules from each completed RNA BAM."""
+    assert resources.rna_splicing_runner is not None
+    library_list = run_dir / "control" / f"{label}_splicing_libraries.txt"
+    atomic_text(library_list, "".join(f"{library}\n" for library in libraries))
+    job_label = f"{label}_splicing"
+    script = run_dir / "control" / "slurm" / f"{job_label}.sbatch"
+    python = args.rna_splicing_python or DEFAULT_RNA_SPLICING_PYTHON
+    python_setup = "module load miniforge/3 genomics-base/latest"
+    if python != DEFAULT_RNA_SPLICING_PYTHON:
+        # An explicitly selected interpreter supplies its own packages.
+        python_setup = "module load miniforge/3\nunset PYTHONPATH"
+    raw_option = (' --raw-barcodes "$LIBRARY_DIR/raw/barcodes.tsv.gz"'
+                  if args.rna_splicing_raw else "")
+    output_checks = "\n".join(
+        f'test -s "$LIBRARY_DIR/{name}"'
+        for name in rna_splicing_output_names(args.rna_splicing_raw)
+    )
+    body = f"""module purge
+module load htslib/1.20 samtools/1.20
+{python_setup}
+module list 2>&1
+command -v samtools >/dev/null
+command -v sed >/dev/null
+command -v {q(python)} >/dev/null
+{q(python)} -c 'import numpy, pandas, scipy, anndata, pysam, velocyto, threadpoolctl'
+LIBRARY=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" {q(library_list)})
+LIBRARY_DIR={q(root / 'mapping_output')}/"$LIBRARY"
+{q(python)} {q(resources.rna_splicing_runner)} \\
+    --bam "$LIBRARY_DIR/gex.bam" \\
+    --gtf {q(args.rna_splicing_gtf)} \\
+    --barcodes "$LIBRARY_DIR/filtered/barcodes.tsv.gz" \\
+    --output-dir "$LIBRARY_DIR/splicing" \\
+    --matrix-output-dir "$LIBRARY_DIR" \\
+    --sample-id "$LIBRARY" \\
+    --strand forward \\
+    --threads "$SLURM_CPUS_PER_TASK" \\
+    --sort-memory-mb 2048{raw_option}
+{output_checks}
+"""
+    write_sbatch(
+        script,
+        sbatch_text(
+            job_label,
+            run_dir / "logs",
+            body,
+            cpus=args.rna_threads,
+            memory=f"{args.rna_mem_gb}G",
+            array=f"0-{len(libraries) - 1}%{args.array_max_concurrent or 2}",
+        ),
+    )
+    return JobSpec(job_label, script, dependencies=list(dependencies))
+
+
 def generate_atac_qc_job(
     libraries: Sequence[int],
     atac_base: Path,
@@ -2718,6 +2819,8 @@ def validation_checks(
     include_trim_barcode_qc: bool,
     include_empty_drop_qc: bool,
     rna3_bam_evidence: bool,
+    rna_splicing: bool = False,
+    rna_splicing_raw: bool = False,
 ) -> list[tuple[str, str, str]]:
     checks: list[tuple[str, str, str]] = []
     if inputs.rna3:
@@ -2731,6 +2834,11 @@ def validation_checks(
                     bam_evidence=rna3_bam_evidence,
                 )
             )
+            if rna_splicing:
+                checks.extend(
+                    ("rna3_splicing", library, str(base / name))
+                    for name in rna_splicing_output_names(rna_splicing_raw)
+                )
         checks.extend(
             nextflow_project_output_checks(
                 "rna3", run_dir / "rna3" / "mapping_project"
@@ -2785,6 +2893,12 @@ def validation_checks(
                         f"rna5_{read_format}", library, base
                     )
                 )
+                if rna_splicing:
+                    checks.extend(
+                        (f"rna5_{read_format}_splicing", library,
+                         str(base / name))
+                        for name in rna_splicing_output_names(rna_splicing_raw)
+                    )
             format_project = run_dir / "rna5" / "formats" / read_format / "mapping_project"
             if discovery.rna5_libraries_by_format.get(read_format):
                 checks.extend(
@@ -2881,6 +2995,8 @@ def generate_validation_job(
     include_trim_barcode_qc: bool,
     include_empty_drop_qc: bool,
     rna3_bam_evidence: bool,
+    rna_splicing: bool = False,
+    rna_splicing_raw: bool = False,
 ) -> JobSpec:
     checks = validation_checks(
         inputs,
@@ -2891,6 +3007,8 @@ def generate_validation_job(
         include_trim_barcode_qc,
         include_empty_drop_qc,
         rna3_bam_evidence,
+        rna_splicing,
+        rna_splicing_raw,
     )
     check_file = run_dir / "control" / "expected_outputs.tsv"
     atomic_text(
@@ -3430,6 +3548,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--atac-whitelist", default=DEFAULT_ATAC_WHITELIST)
     parser.add_argument(
+        "--rna-splicing", action="store_true",
+        help="Count spliced/unspliced RNA molecules from the BAMs after mapping",
+    )
+    parser.add_argument(
+        "--rna-splicing-raw", action="store_true",
+        help="Also count the raw barcode roster and export splicing_raw matrices; requires --rna-splicing",
+    )
+    parser.add_argument(
+        "--rna-splicing-gtf", default=None,
+        help="Absolute path to the GTF matching the RNA mapping reference",
+    )
+    parser.add_argument(
+        "--rna-splicing-python", default=None,
+        help=("Absolute Python interpreter for the splicing environment; "
+              f"default: {DEFAULT_RNA_SPLICING_PYTHON} from genomics-base/latest"),
+    )
+    parser.add_argument(
         "--rna-barcode-base",
         default=None,
         help=(
@@ -3744,6 +3879,20 @@ def orchestrate(args: argparse.Namespace) -> int:
     )
     if not (inputs.rna3 or inputs.atac or inputs.rna5):
         raise OrchestratorError("select at least one of --rna3-runs, --atac-runs, --rna5-runs")
+    if args.rna_splicing_raw and not args.rna_splicing:
+        raise OrchestratorError("--rna-splicing-raw requires --rna-splicing")
+    if args.rna_splicing:
+        if not (inputs.rna3 or inputs.rna5):
+            raise OrchestratorError("--rna-splicing requires an RNA input")
+        if args.rna_threads < 2:
+            raise OrchestratorError("--rna-splicing requires --rna-threads of at least 2")
+        if not args.rna_splicing_gtf or not Path(args.rna_splicing_gtf).is_absolute():
+            raise OrchestratorError("--rna-splicing requires an absolute --rna-splicing-gtf")
+        args.rna_splicing_gtf = str(Path(args.rna_splicing_gtf).resolve())
+        if args.rna_splicing_python:
+            if not Path(args.rna_splicing_python).is_absolute():
+                raise OrchestratorError("--rna-splicing-python must be an absolute path")
+            args.rna_splicing_python = os.path.abspath(args.rna_splicing_python)
     if args.libraries and any(value < 1 for value in args.libraries):
         raise OrchestratorError("--libraries values must be positive integers")
     if args.libraries:
@@ -3990,6 +4139,23 @@ def orchestrate(args: argparse.Namespace) -> int:
             )
         )
 
+    if args.rna_splicing:
+        current_labels = {job.label for job in jobs}
+        if rna3_groups:
+            jobs.append(generate_rna_splicing_job(
+                "rna3", discovery.libraries["rna3"], run_dir / "rna3",
+                run_dir, args, resources,
+                ["rna3_map"] if "rna3_map" in current_labels else [],
+            ))
+        for read_format, _runs, root in rna5_groups:
+            label = f"rna5_{read_format.replace('-', '_')}"
+            map_label = f"{label}_map"
+            jobs.append(generate_rna_splicing_job(
+                label, discovery.rna5_libraries_by_format[read_format], root,
+                run_dir, args, resources,
+                [map_label] if map_label in current_labels else [],
+            ))
+
     if "qc" in stages and not args.no_trim_info:
         if rna3_groups:
             rna3_dependencies = sorted(
@@ -4153,6 +4319,8 @@ def orchestrate(args: argparse.Namespace) -> int:
                 bool("qc" in stages and not args.no_trim_info),
                 bool(args.empty_drop_roster),
                 args.rna3_bam_evidence_from_bam,
+                args.rna_splicing,
+                args.rna_splicing_raw,
             )
         )
 

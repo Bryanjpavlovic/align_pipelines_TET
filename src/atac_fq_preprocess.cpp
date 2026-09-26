@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <regex>
 #include <string>
 #include <sys/stat.h>
 
@@ -16,24 +17,24 @@ namespace {
 
 void print_help(FILE* stream) {
     std::fprintf(stream,
-        "Usage: atac_fq_preprocess -1 R1 -2 R2 -3 R3 -o DIR -w FILE [-W FILE]\n"
+        "Usage: atac_fq_preprocess -1 GENOMIC1 -2 BARCODE -3 GENOMIC2 -o DIR -w FILE [-W FILE]\n"
         "\n"
-        "Preprocess 10x Genomics scATAC-seq or Multiome ATAC FASTQs. The R2\n"
+        "Preprocess 10x Genomics scATAC-seq or Multiome ATAC FASTQs. The cell\n"
         "barcode is matched to the supplied whitelist with up to one substitution,\n"
-        "and records without a valid barcode are omitted. The genomic R1 and R3\n"
+        "and records without a valid barcode are omitted. The two genomic\n"
         "reads are emitted as a paired FASTQ set with the corrected barcode added\n"
         "to each read header as a CB:Z tag.\n"
         "\n"
         "Required arguments:\n"
         "  -1, --r1 FILE          Forward genomic-read FASTQ (plain or gzip)\n"
-        "  -2, --r2 FILE          Cell-barcode FASTQ (plain or gzip)\n"
-        "  -3, --r3 FILE          Reverse genomic-read FASTQ (plain or gzip)\n"
+        "  -2, --r2 FILE          Cell-barcode FASTQ (legacy R2 or new I2)\n"
+        "  -3, --r3 FILE          Reverse genomic FASTQ (legacy R3 or new R2)\n"
         "  -o, --output_dir DIR  Directory for the two output FASTQs\n"
         "  -w, --whitelist FILE  scATAC whitelist; for Multiome, the RNA\n"
         "                         whitelist whose barcodes should be reported\n"
         "\n"
         "Multiome option:\n"
-        "  -W, --whitelist2 FILE Multiome ATAC whitelist to match in R2. Entries\n"
+        "  -W, --whitelist2 FILE Multiome ATAC whitelist to match in -2. Entries\n"
         "                         must correspond by line to the RNA whitelist\n"
         "                         supplied with -w.\n"
         "\n"
@@ -41,9 +42,9 @@ void print_help(FILE* stream) {
         "  -h, --help            Display this help and exit\n"
         "\n"
         "Output naming:\n"
-        "  The outputs retain the input R1 and R2 basenames under DIR. The second\n"
-        "  output contains the reverse genomic sequence from R3 but intentionally\n"
-        "  uses the R2 basename expected by the downstream paired-read workflow.\n");
+        "  Both gzip outputs use the forward input basename, with its terminal\n"
+        "  R1 token replaced by R2 for the reverse genomic output. The .fastq\n"
+        "  or .fq extension is retained; .gz is appended for plain inputs.\n");
 }
 
 int usage_error(const char* message) {
@@ -255,16 +256,20 @@ int main(int argc, char* argv[]) {
     }
 
     const std::string r1_basename = filename_nopath(r1_path);
-    const std::string r2_basename = filename_nopath(r2_path);
-    if (r1_basename.empty() || r2_basename.empty()) {
-        std::fprintf(stderr, "ERROR: input FASTQ paths must end with a filename\n");
+    const std::regex read_name("^(.*_)?R1(_[0-9]+)?(\\.fastq|\\.fq)(\\.gz)?$");
+    std::smatch name_parts;
+    if (!std::regex_match(r1_basename, name_parts, read_name)) {
+        std::fprintf(stderr,
+            "ERROR: forward FASTQ name must end in R1[_chunk].fastq[.gz] or R1[_chunk].fq[.gz]\n");
         return 1;
     }
+    const std::string prefix = name_parts[1].str();
+    const std::string suffix = name_parts[2].str() + name_parts[3].str() + ".gz";
 
     const std::string separator = output_directory == "/" ? "" : "/";
     const std::string output_paths[2] = {
-        output_directory + separator + r1_basename,
-        output_directory + separator + r2_basename
+        output_directory + separator + prefix + "R1" + suffix,
+        output_directory + separator + prefix + "R2" + suffix
     };
     const std::string input_paths[3] = {r1_path, r2_path, r3_path};
 

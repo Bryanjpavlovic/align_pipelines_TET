@@ -48,7 +48,7 @@ if (params.rg_metadata){
  * the library name. Upstream consolidation appends the run tag as
  * __Run001 between _S##_L## and _R#_.
  *
- * After NF regex extracts match[2] (everything before _R3):
+ * After removing the read token and FASTQ suffix:
  *   Tet_2025_Multiome-ATAC_3_S3_L002__Run001 -> Tet_2025_Multiome-ATAC_3_S3_L002
  *   Tet_2025_Multiome-ATAC_3_S3_L002         -> Tet_2025_Multiome-ATAC_3_S3_L002
  *
@@ -62,6 +62,16 @@ def strip_run_tag(s){
 def canonical_library_name(s){
     def before_sample = strip_run_tag(s).replaceFirst(/_S\d+_L\d+$/, '')
     return before_sample.replaceFirst(/(?:_L\d+)+$/, '')
+}
+
+// Installed packages keep binaries in bin/; source checkouts build at the root.
+def atac_helper(name){
+    for (def candidate : [projectDir.resolve('bin').resolve(name), projectDir.resolve(name)]){
+        if (Files.isExecutable(candidate)){
+            return candidate.toString()
+        }
+    }
+    return name
 }
 
 process preproc_atac_files{
@@ -79,14 +89,14 @@ process preproc_atac_files{
     output:
     tuple val(lib),
     val(basename),
-    file("preproc/*_R1*.fastq.gz"),
-    file("preproc/*_R2*.fastq.gz"),
+    file("preproc/*_R1*.{fastq,fq}.gz"),
+    file("preproc/*_R2*.{fastq,fq}.gz"),
     file(idx)
 
     script:
     """
     mkdir preproc
-    ${baseDir}/atac_fq_preprocess -1 ${r1} -2 ${r2} -3 ${r3} -o preproc -w ${wl}
+    ${atac_helper('atac_fq_preprocess')} -1 ${r1} -2 ${r2} -3 ${r3} -o preproc -w ${wl}
     """
 }
 process preproc_atac_files_multiome{
@@ -105,14 +115,14 @@ process preproc_atac_files_multiome{
     output:
     tuple val(lib),
     val(basename),
-    file("preproc/*_R1*.fastq.gz"),
-    file("preproc/*_R2*.fastq.gz"),
+    file("preproc/*_R1*.{fastq,fq}.gz"),
+    file("preproc/*_R2*.{fastq,fq}.gz"),
     file(idx)
 
     script:
     """
     mkdir preproc
-    ${baseDir}/atac_fq_preprocess -1 ${r1} -2 ${r2} -3 ${r3} -o preproc -w ${wl_rna} -W ${wl_atac}
+    ${atac_helper('atac_fq_preprocess')} -1 ${r1} -2 ${r2} -3 ${r3} -o preproc -w ${wl_rna} -W ${wl_atac}
     """
 }
 
@@ -137,6 +147,7 @@ process align_atac_files{
 
     script:
     """
+    set -o pipefail
     minimap2 -t ${params.threads} -y -a -x sr -R "${rg_string}" ${idx} ${r1} ${r2} \
 | samtools sort -n - | samtools fixmate -m - - | samtools sort -o ${basename}_${num}_sorted.bam
     samtools index ${basename}_${num}_sorted.bam    
@@ -232,10 +243,11 @@ process atac_fragments{
 
     script:
     """
+    set -o pipefail
     sinto fragments -p ${params.threads} --collapse_within -m 30 -t CB \
 --use_chrom "." -b ${bam} -f atac_fragments.tsv
     cat atac_fragments.tsv | sort -k1,1V -k2,2n -k3,3n | bgzip > atac_fragments.tsv.gz
-    tabix -s 1 -b 2 -e 3 atac_fragments.tsv.gz 
+    tabix -p bed atac_fragments.tsv.gz
     """
 }
 
@@ -250,13 +262,42 @@ def peek_check_bc(filePath){
             line = new BufferedReader(reader).readLine()        
         }
     }
-    def lnsplit = line.split(' ')
+    def lnsplit = (line ?: '').split(' ')
     if ( lnsplit[-1] ==~ /^CB:Z:[ACGT]+$/){
         return true
     }
     else{
         return false
     }
+}
+
+// Return biological roles: basename, genomic mate 1, barcode, genomic mate 2.
+// A null barcode denotes an already-preprocessed CB-tagged genomic pair.
+def atac_fastq_set(r1){
+    def match = (r1.getFileName().toString() =~ /^(.+)_R1(_\d+)?\.(fastq|fq)(\.gz)?$/)[0]
+    def stem = match[1]
+    // Keep historical metadata keys for _001; distinguish later source chunks.
+    def fnbase = stem + (match[2] && match[2] != '_001' ? '__Part' + match[2].substring(1) : '')
+    def suffix = (match[2] ?: '') + '.' + match[3] + (match[4] ?: '')
+    def r2 = r1.resolveSibling(stem + '_R2' + suffix)
+    def r3 = r1.resolveSibling(stem + '_R3' + suffix)
+    def i2 = r1.resolveSibling(stem + '_I2' + suffix)
+    if (!Files.exists(r2)){
+        error("Missing ATAC R2 companion for " + r1)
+    }
+    if (Files.exists(r3) && Files.exists(i2)){
+        error("Ambiguous ATAC read layout (both R3 and I2): " + r1)
+    }
+    if (Files.exists(r3)){
+        return [fnbase, r1, r2, r3]
+    }
+    if (Files.exists(i2)){
+        return [fnbase, r1, i2, r2]
+    }
+    if (peek_check_bc(r1) && peek_check_bc(r2)){
+        return [fnbase, r1, null, r2]
+    }
+    error("Raw ATAC reads require a barcode companion (R2/R3 or I2/R2): " + r1)
 }
 
 workflow align_atac_demux_species{
@@ -272,32 +313,15 @@ workflow align_atac_demux_species{
         error("rg_metadata is required; source FASTQ provenance may not be omitted")
     }
     
-    def atac_triples = Channel.fromPath("${params.demux_species}/*/*/ATAC*_R3*.fastq.gz").map{ fn -> 
-        def r3 = fn.toString().trim()
-        def libn = r3.split('/')[-3]
-        def species = r3.split('/')[-2]
-        
-        def match = (r3 =~ /(.*)\/(.*)\_R3(_\d+)?\.(fastq|fq)(\.gz)?/)[0]
-        def dirn = ""
-        if (match[1] != null && match[1] != ""){
-            dirn += match[1] + '/'
-        }
-        def end = ""
-        if (match[3] != null){
-            end = match[3]
-        }
-        def gz = ""
-        if (match[5] != null){
-            gz = match[5]
-        }
-        def r1 = dirn + match[2] + "_R1" + end + '.' + match[4] + gz
-        def r2 = dirn + match[2] + "_R2" + end + '.' + match[4] + gz
-        def fnbase = match[2]
-        if (! atac_ref_map[species]){
+    def atac_sets = Channel.fromPath("${params.demux_species}/*/*/ATAC*_R1*.{fastq,fq}.gz").map{ fn ->
+        def libn = fn.getParent().getParent().getFileName().toString()
+        def species = fn.getParent().getFileName().toString()
+        if (!atac_ref_map[species]){
             error("Species " + species + " does not have an ATAC reference specified")
         }
-        return [ libn + "/" + species, fnbase, file(r1), file(r2), file(r3), file(atac_ref_map[species]) ]
+        [libn + "/" + species] + atac_fastq_set(fn) + [file(atac_ref_map[species])]
     }
+    def atac_triples = atac_sets.filter{ lib, fnbase, r1, barcode, mate2, idx -> barcode != null }
     
     if (params.multiome){
         if (!params.rna_whitelist || !params.atac_whitelist){
@@ -315,16 +339,8 @@ workflow align_atac_demux_species{
         atac_preproc1 = preproc_atac_files(atac_triples.combine(wl))
     } 
 
-    def atac_pairs = Channel.fromFilePairs("${params.demux_species}/*/*/ATAC*_S*L*_R{1,2}*.fastq.gz").map{ id, reads ->
-        def libn = reads[0].toString().split('/')[-3]
-        def species = reads[0].toString().split('/')[-2]
-        if (! atac_ref_map[species]){
-            error("Species " + species + " does not have an ATAC reference specified")
-        }
-        [ libn + "/" + species, id, reads[0], reads[1], file(atac_ref_map[species]) ]
-    }.filter{ lib, fnbase, r1, r2, idx ->
-        return peek_check_bc(r1) && peek_check_bc(r2)
-    }
+    def atac_pairs = atac_sets.filter{ lib, fnbase, r1, barcode, mate2, idx -> barcode == null }
+        .map{ lib, fnbase, r1, barcode, mate2, idx -> [lib, fnbase, r1, mate2, idx] }
     
     atac_bams = atac_preproc1.concat(atac_pairs).map{ tup ->
         def lib = tup[0]
@@ -347,12 +363,12 @@ process split_reads_atac{
     tuple val(libname),
     val(fnbase),
     path(idx),
-    path("*_R1_001.*.fastq.gz"),
-    path("*_R2_001.*.fastq.gz")
+    path("*_R1*.fastq.gz"),
+    path("*_R2*.fastq.gz")
 
     script:
     """
-    ${baseDir}/split_read_files -1 ${r1} -2 ${r2} -o . -n ${params.num_chunks}
+    ${atac_helper('split_read_files')} -1 ${r1} -2 ${r2} -o . -n ${params.num_chunks}
     """
 }
 
@@ -377,30 +393,13 @@ workflow align_atac{
 
     def idx_atac = Channel.fromPath(params.atac_ref)
     
-    // Get non-preprocessed files
-    // strip_run_tag removes an optional __Run001 tag before library name extraction.
-    // fnbase keeps the full name (with run tag) as the exact metadata key.
-    def atac_triples = libs.cross(Channel.fromPath("${params.atac_dir}/*_R3*.fastq.gz").map{ fn ->
-        def r3 = fn.toString().trim()
-        def match = (r3 =~ /(.*)\/(.*)\_R3(_\d+)?\.(fastq|fq)(\.gz)?/)[0]
-        def libname_atac = canonical_library_name(match[2])
-        def dirn = ""
-        if (match[1] != null && match[1] != ""){
-            dirn += match[1] + '/'
-        }
-        def end = ""
-        if (match[3] != null){
-            end = match[3]
-        }
-        def gz = ""
-        if (match[5] != null){
-            gz = match[5]
-        }
-        def r1 = dirn + match[2] + "_R1" + end + '.' + match[4] + gz
-        def r2 = dirn + match[2] + "_R2" + end + '.' + match[4] + gz
-        def fnbase = match[2]
-        return [ atac_map[libname_atac], fnbase, file(r1), file(r2), file(r3)]
-    }).map{ lib, tup -> tup }
+    // Resolve each source unit separately so legacy and I2 layouts can coexist.
+    // fnbase keeps the full run-tagged name as the exact metadata key.
+    def atac_sets = libs.cross(Channel.fromPath("${params.atac_dir}/*_R1*.{fastq,fq}.gz").map{ fn ->
+        def fnbase = fn.getFileName().toString().replaceFirst(/_R1(_\d+)?\.(fastq|fq)\.gz$/, '')
+        [atac_map[canonical_library_name(fnbase)], fn]
+    }).map{ lib, tup -> [tup[0]] + atac_fastq_set(tup[1]) }
+    def atac_triples = atac_sets.filter{ lib, fnbase, r1, barcode, mate2 -> barcode != null }
     
     if (params.multiome){
         if (!params.atac_whitelist || !params.rna_whitelist){
@@ -418,14 +417,8 @@ workflow align_atac{
         atac_preproc1 = preproc_atac_files(atac_triples.combine(idx_atac).combine(wl))
     } 
     
-    // Get pre-processed files
-    // Same strip_run_tag logic for already-preprocessed files
-    def atac_pairs = libs.cross(
-        Channel.fromFilePairs("${params.atac_dir}/*_S*L*_R{1,2}*.fastq.gz").map{ id, reads ->
-        [ atac_map[canonical_library_name(id)], id, reads[0], reads[1]]
-    }).map{ lib, tup -> tup }.filter{ lib, fnbase, r1, r2 ->
-        return peek_check_bc(r1) && peek_check_bc(r2)
-    }
+    def atac_pairs = atac_sets.filter{ lib, fnbase, r1, barcode, mate2 -> barcode == null }
+        .map{ lib, fnbase, r1, barcode, mate2 -> [lib, fnbase, r1, mate2] }
     atac_preproc2 = atac_pairs.combine(idx_atac)
     
     atac_bams = split_reads_atac(atac_preproc1.concat(atac_preproc2)).flatMap{ 

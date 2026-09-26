@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-ATAC-seq QC Statistics Collection - V3
+ATAC-seq QC Statistics Collection - V4
 
 Collects QC metrics from ATAC-seq BAM and fragment files with proper filtering:
 - Uses RNA-seq filtered barcodes as the valid cell list
 - Analyzes with and without mitochondrial reads
 - Reports metrics for all 4 combinations
-- FIXED: Samples fragment sizes throughout entire file for valid_bc slices
+- Counts primary read ends and assigned pairs separately
+- Includes zero-count RNA-called cells in per-cell medians
+- Samples fragment sizes throughout the file for each slice
 
 Usage:
   python collect_atac_qc.py --generate-test-sbatch --library 1
@@ -164,14 +166,21 @@ def analyze_bam(bam_path, valid_barcodes, threads=4):
     
     barcode_reads_all = defaultdict(int)
     barcode_reads_no_mito = defaultdict(int)
+    barcode_pairs_all = defaultdict(int)
+    barcode_pairs_no_mito = defaultdict(int)
     
     total_reads = 0
     mapped_reads = 0
     duplicate_reads = 0
     mito_reads = 0
+    total_read_pairs = 0
+    mapped_read_pairs = 0
+    mito_read_pairs = 0
+    nonprimary_alignments = 0
     
     cmd = ['samtools', 'view', '-@', str(threads), str(bam_path)]
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # Leave stderr attached to the job log; an unread stderr pipe can block.
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
     
     for i, line in enumerate(process.stdout):
         if i % 10000000 == 0 and i > 0:
@@ -181,8 +190,11 @@ def analyze_bam(bam_path, valid_barcodes, threads=4):
         if len(fields) < 11:
             continue
         
-        total_reads += 1
         flag = int(fields[1])
+        if flag & (256 | 2048):
+            nonprimary_alignments += 1
+            continue
+        total_reads += 1
         chrom = fields[2]
         
         if not (flag & 4):
@@ -190,7 +202,7 @@ def analyze_bam(bam_path, valid_barcodes, threads=4):
         if flag & 1024:
             duplicate_reads += 1
         
-        is_mito = (chrom == MITO_CHROM)
+        is_mito = not (flag & 4) and chrom == MITO_CHROM
         if is_mito:
             mito_reads += 1
         
@@ -204,17 +216,45 @@ def analyze_bam(bam_path, valid_barcodes, threads=4):
             barcode_reads_all[cb] += 1
             if not is_mito:
                 barcode_reads_no_mito[cb] += 1
+
+        # Primary read 1 represents one assigned input pair, including pairs
+        # with unmapped mates. Sequencing depth includes duplicate-marked pairs.
+        if (flag & 1) and (flag & 64):
+            total_read_pairs += 1
+            if not (flag & 4) or not (flag & 8):
+                mapped_read_pairs += 1
+            mate_chrom = chrom if fields[6] == '=' else fields[6]
+            pair_is_mito = is_mito or (not (flag & 8) and mate_chrom == MITO_CHROM)
+            if pair_is_mito:
+                mito_read_pairs += 1
+            if cb:
+                barcode_pairs_all[cb] += 1
+                if not pair_is_mito:
+                    barcode_pairs_no_mito[cb] += 1
     
-    process.wait()
+    returncode = process.wait()
+    if returncode != 0:
+        raise RuntimeError(f"samtools view failed for {bam_path} (exit {returncode})")
     
     print(f"    Total reads: {total_reads:,}")
     print(f"    Mapped reads: {mapped_reads:,}")
     
     stats = {
+        'qc_schema_version': 4,
+        'read_count_unit': 'primary_read_ends_in_barcode_assigned_BAM_including_duplicates_and_unmapped',
+        'read_pair_count_unit': 'primary_read1_records_in_barcode_assigned_BAM_including_duplicates_and_unmapped',
+        'mapped_read_pair_definition': 'at_least_one_mapped_mate',
+        'no_mito_read_pair_definition': 'neither_mapped_mate_on_chrM;_unmapped_pairs_retained',
+        'called_cell_median_population': 'all_paired_RNA_called_cells_including_zero_counts',
         'total_reads': total_reads,
         'mapped_reads': mapped_reads,
         'duplicate_reads': duplicate_reads,
         'mito_reads': mito_reads,
+        'total_read_pairs': total_read_pairs,
+        'mapped_read_pairs': mapped_read_pairs,
+        'mito_read_pairs': mito_read_pairs,
+        'nonprimary_alignments': nonprimary_alignments,
+        'pair_mapping_rate': (mapped_read_pairs / total_read_pairs * 100) if total_read_pairs else 0,
         'mapping_rate': (mapped_reads / total_reads * 100) if total_reads > 0 else 0,
         'duplicate_rate': (duplicate_reads / total_reads * 100) if total_reads > 0 else 0,
         'mito_fraction': (mito_reads / mapped_reads * 100) if mapped_reads > 0 else 0,
@@ -229,7 +269,8 @@ def analyze_bam(bam_path, valid_barcodes, threads=4):
     }
     
     for slice_name, (bc_set, reads_dict) in slices.items():
-        read_counts = [reads_dict[bc] for bc in bc_set if reads_dict.get(bc, 0) > 0]
+        read_counts = [reads_dict.get(bc, 0) for bc in bc_set]
+        stats[f'{slice_name}_num_cells_with_reads'] = sum(count > 0 for count in read_counts)
         if read_counts:
             stats[f'{slice_name}_num_cells'] = len(read_counts)
             stats[f'{slice_name}_total_reads'] = sum(read_counts)
@@ -239,6 +280,20 @@ def analyze_bam(bam_path, valid_barcodes, threads=4):
         else:
             for suffix in ['_num_cells', '_total_reads', '_median_reads_per_cell', '_mean_reads_per_cell', '_frac_reads']:
                 stats[f'{slice_name}{suffix}'] = 0
+
+    pair_slices = {
+        'all_bc_all_reads': (set(barcode_pairs_all), barcode_pairs_all),
+        'all_bc_no_mito': (set(barcode_pairs_no_mito), barcode_pairs_no_mito),
+        'valid_bc_all_reads': (valid_barcodes, barcode_pairs_all),
+        'valid_bc_no_mito': (valid_barcodes, barcode_pairs_no_mito),
+    }
+    for slice_name, (bc_set, pairs_dict) in pair_slices.items():
+        pair_counts = [pairs_dict.get(bc, 0) for bc in bc_set]
+        stats[f'{slice_name}_num_cells_with_read_pairs'] = sum(count > 0 for count in pair_counts)
+        stats[f'{slice_name}_total_read_pairs'] = sum(pair_counts)
+        stats[f'{slice_name}_median_read_pairs_per_cell'] = float(np.median(pair_counts)) if pair_counts else 0
+        stats[f'{slice_name}_mean_read_pairs_per_cell'] = float(np.mean(pair_counts)) if pair_counts else 0
+        stats[f'{slice_name}_frac_read_pairs'] = (sum(pair_counts) / total_read_pairs * 100) if total_read_pairs else 0
     
     return stats
 
@@ -345,17 +400,17 @@ def analyze_fragments(frag_path, valid_barcodes):
     }
     
     for slice_name, (bc_set, frags_dict) in slice_data.items():
-        frag_counts = [frags_dict[bc] for bc in bc_set if frags_dict.get(bc, 0) > 0]
+        frag_counts = [frags_dict.get(bc, 0) for bc in bc_set]
+        stats[f'{slice_name}_num_cells_with_frags'] = sum(count > 0 for count in frag_counts)
         sizes = frag_sizes[slice_name]
         
         if frag_counts:
-            stats[f'{slice_name}_num_cells'] = len(frag_counts)
             stats[f'{slice_name}_total_frags'] = sum(frag_counts)
             stats[f'{slice_name}_median_frags_per_cell'] = float(np.median(frag_counts))
             stats[f'{slice_name}_mean_frags_per_cell'] = float(np.mean(frag_counts))
             stats[f'{slice_name}_frac_frags'] = (sum(frag_counts) / total_fragments * 100) if total_fragments > 0 else 0
         else:
-            for suffix in ['_num_cells', '_total_frags', '_median_frags_per_cell', '_mean_frags_per_cell', '_frac_frags']:
+            for suffix in ['_total_frags', '_median_frags_per_cell', '_mean_frags_per_cell', '_frac_frags']:
                 stats[f'{slice_name}{suffix}'] = 0
         
         if sizes:
@@ -392,6 +447,7 @@ def collect_library_stats(lib_num, ramdisk, threads=4):
     atac_name, rna_name = get_lib_names(lib_num)
     
     stats = {
+        'qc_schema_version': 4,
         'library_number': lib_num,
         'atac_library': atac_name,
         'rna_library': rna_name,
@@ -411,6 +467,11 @@ def collect_library_stats(lib_num, ramdisk, threads=4):
         print(f"\nFragment Analysis:")
         frag_stats = analyze_fragments(frag_path, valid_barcodes)
         stats.update(frag_stats)
+        # Compatibility alias for a fragment-only collection. In valid-cell
+        # slices the population is the RNA roster, including zero-count cells.
+        for slice_name in ('all_bc_all_reads', 'all_bc_no_mito', 'valid_bc_all_reads', 'valid_bc_no_mito'):
+            stats.setdefault(f'{slice_name}_num_cells', len(valid_barcodes) if slice_name.startswith('valid_')
+                             else stats[f'{slice_name}_num_cells_with_frags'])
     
     # Summary
     prefix = 'valid_bc_no_mito'
@@ -422,10 +483,10 @@ def collect_library_stats(lib_num, ramdisk, threads=4):
     print(f"  Duplicate rate: {stats.get('duplicate_rate', 0):.1f}%")
     print(f"  Mito fraction: {stats.get('mito_fraction', 0):.1f}%")
     print(f"  Valid cells (no mito):")
-    print(f"    Cells with ATAC: {stats.get(f'{prefix}_num_cells', 0):,}")
-    print(f"    Median reads/cell: {stats.get(f'{prefix}_median_reads_per_cell', 0):,.0f}")
+    print(f"    Cells with ATAC fragments: {stats.get(f'{prefix}_num_cells_with_frags', 0):,}")
+    print(f"    Median assigned pairs/cell: {stats.get(f'{prefix}_median_read_pairs_per_cell', 0):,.1f}")
     print(f"    Median frags/cell: {stats.get(f'{prefix}_median_frags_per_cell', 0):,.0f}")
-    print(f"    Frac reads in cells: {stats.get(f'{prefix}_frac_reads', 0):.1f}%")
+    print(f"    Frac assigned pairs in cells: {stats.get(f'{prefix}_frac_read_pairs', 0):.1f}%")
     
     return stats
 
@@ -495,7 +556,7 @@ def generate_sbatch_script(lib_num, test_mode=False):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='ATAC-seq QC Statistics Collection V3')
+    parser = argparse.ArgumentParser(description='ATAC-seq QC Statistics Collection V4')
     parser.add_argument('--generate-test-sbatch', action='store_true')
     parser.add_argument('--generate-all-sbatch', action='store_true')
     parser.add_argument('--library', type=int)
@@ -549,8 +610,12 @@ def main():
         for lib_num in lib_nums:
             stats_file = Path(STATS_DIR) / f"library_{lib_num}_stats.json"
             if stats_file.exists():
-                print(f"  Skipping Library {lib_num} (already done)")
-                continue
+                with open(stats_file) as handle:
+                    existing_stats = json.load(handle)
+                if existing_stats.get('qc_schema_version', 0) >= 4:
+                    print(f"  Skipping Library {lib_num} (QC schema v4 or newer already done)")
+                    continue
+                print(f"  Recollecting Library {lib_num} (legacy QC schema)")
             script, is_slow = generate_sbatch_script(lib_num, test_mode=False)
             if is_slow:
                 slow_scripts.append(script)

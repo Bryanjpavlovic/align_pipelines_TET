@@ -39,6 +39,8 @@ COLORS = {
     'num_cells': COLOR_COUNT,
     'frac_reads_in_cells': COLOR_PERCENT,
     'median_reads_per_cell': COLOR_DEPTH,
+    'frac_read_pairs_in_cells': COLOR_PERCENT,
+    'median_read_pairs_per_cell': COLOR_DEPTH,
     'median_frags_per_cell': COLOR_DEPTH,
     'mapping_rate': COLOR_RATE,
     'duplicate_rate': COLOR_RATE,
@@ -81,9 +83,15 @@ def load_all_stats(stats_dir):
             row = {
                 'Library': lib_name,
                 'Library_Number': lib_num,
+                'qc_schema_version': stats.get('qc_schema_version', 3),
                 'num_cells': stats.get('valid_bc_no_mito_num_cells', stats.get('num_cells', 0)),
+                'rna_called_cells': stats.get('rna_filtered_cells', np.nan),
+                'cells_with_fragments': stats.get('valid_bc_no_mito_num_cells_with_frags', np.nan),
                 'frac_reads_in_cells': stats.get('valid_bc_no_mito_frac_reads', stats.get('frac_reads_in_cells', 0)),
                 'median_reads_per_cell': stats.get('valid_bc_no_mito_median_reads_per_cell', stats.get('median_reads_per_cell', 0)),
+                'frac_read_pairs_in_cells': stats.get('valid_bc_no_mito_frac_read_pairs', np.nan),
+                'median_read_pairs_per_cell': stats.get('valid_bc_no_mito_median_read_pairs_per_cell', np.nan),
+                'median_assigned_pairs_per_RNA_cell': stats.get('valid_bc_all_reads_median_read_pairs_per_cell', np.nan),
                 'median_frags_per_cell': stats.get('valid_bc_no_mito_median_frags_per_cell', stats.get('median_frags_per_cell', 0)),
                 'mapping_rate': stats.get('mapping_rate', 0),
                 'duplicate_rate': stats.get('duplicate_rate', 0),
@@ -93,6 +101,7 @@ def load_all_stats(stats_dir):
                 'mono_nuc_fraction': stats.get('valid_bc_no_mito_mono_nuc_fraction', stats.get('mono_nuc_fraction', 0)),
                 'di_nuc_fraction': stats.get('valid_bc_no_mito_di_nuc_fraction', stats.get('di_nuc_fraction', 0)),
                 'total_reads': stats.get('total_reads', 0),
+                'total_read_pairs': stats.get('total_read_pairs', np.nan),
                 'total_frags': stats.get('total_fragments', stats.get('total_frags', 0)),
                 'reads_in_cells': stats.get('valid_bc_no_mito_total_reads', stats.get('reads_in_cells', 0)),
                 'frags_in_cells': stats.get('valid_bc_no_mito_total_frags', stats.get('frags_in_cells', 0)),
@@ -107,6 +116,8 @@ def load_all_stats(stats_dir):
     
     df = pd.DataFrame(data_list)
     df = df.sort_values('Library_Number').reset_index(drop=True)
+    if (df['qc_schema_version'] >= 4).any() and (df['qc_schema_version'] < 4).any():
+        raise ValueError('QC files mix legacy alignment/nonzero-cell metrics with primary-read/zero-inclusive metrics. Recollect the legacy libraries before combining them.')
     
     return df, fragment_hists
 
@@ -114,6 +125,7 @@ def load_all_stats(stats_dir):
 def plot_qc_boxplots(df, output_dir):
     """Create clean boxplot dashboard for QC metrics."""
     
+    revised = (df['qc_schema_version'] >= 4).all()
     metrics = [
         ('num_cells', 'Number of Cells', None, 1),
         ('frac_reads_in_cells', 'Fraction Reads in Cells (%)', '%', 1),
@@ -124,6 +136,19 @@ def plot_qc_boxplots(df, output_dir):
         ('mito_fraction', 'Mitochondrial Fraction (%)', '%', 1),
         ('frac_frags_in_cells', 'Fraction Fragments in Cells (%)', '%', 1),
     ]
+    if revised:
+        metrics[:3] = [
+            ('rna_called_cells', 'RNA-called Cells', None, 1),
+            ('frac_read_pairs_in_cells', 'Pairs in Cells, no chrM (%)', '%', 1),
+            ('median_read_pairs_per_cell', 'Assigned Pairs/Cell, no chrM', None, 1000),
+        ]
+        metrics[3] = ('median_frags_per_cell', 'Unique Fragments/RNA Cell', None, 1000)
+        metrics[4] = ('mapping_rate', 'Mapped Primary Read Ends (%)', '%', 1)
+        metrics[5] = ('duplicate_rate', 'Duplicate Primary Read Ends (%)', '%', 1)
+    else:
+        metrics[0] = ('num_cells', 'Cells with ATAC Fragments', None, 1)
+        metrics[2] = ('median_reads_per_cell', 'Alignments/Observed Cell', None, 1000)
+        metrics[3] = ('median_frags_per_cell', 'Fragments/Observed Cell', None, 1000)
     
     fig, axes = plt.subplots(2, 4, figsize=(11, 6))
     axes = axes.flatten()
@@ -180,7 +205,9 @@ def plot_qc_boxplots(df, output_dir):
         ax.set_xlim(0.4, 1.6)
     
     plt.tight_layout(h_pad=1.5, w_pad=0.8)
-    fig.suptitle('ATAC-seq QC Dashboard: RNA-Filtered Cells (excluding chrM)', 
+    title = ('ATAC-seq QC: RNA-called-cell depth includes zeros; cell-depth panels exclude chrM'
+             if revised else 'Legacy ATAC QC: observed-cell depth excludes chrM; BAM metrics count alignments')
+    fig.suptitle(title,
                  fontsize=11, fontweight='bold', y=1.02)
     
     output_path = output_dir / 'atac_qc_boxplots.png'
